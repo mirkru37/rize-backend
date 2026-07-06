@@ -33,3 +33,38 @@ func TestMetricsRecordsRequestAndExposesHandler(t *testing.T) {
 		t.Error("expected http_requests_total metric to be present in /metrics output")
 	}
 }
+
+// TestMetricsUnmatchedRoutesShareOneLabel asserts that requests with no chi
+// route context (as happens for unmatched/404 requests) are recorded under
+// a single constant "unmatched" path label rather than the raw request
+// path, so a client cannot inflate Prometheus label cardinality simply by
+// requesting distinct nonexistent paths.
+func TestMetricsUnmatchedRoutesShareOneLabel(t *testing.T) {
+	handler := Metrics()(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+
+	junkPaths := []string{"/this-does-not-exist", "/another/junk/path?with=query"}
+	for _, p := range junkPaths {
+		req := httptest.NewRequest(http.MethodGet, p, nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("status for %q = %d, want %d", p, rec.Code, http.StatusNotFound)
+		}
+	}
+
+	metricsRec := httptest.NewRecorder()
+	promhttp.Handler().ServeHTTP(metricsRec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := metricsRec.Body.String()
+
+	if !strings.Contains(body, `path="unmatched"`) {
+		t.Error(`expected metrics to contain path="unmatched" label`)
+	}
+	for _, p := range junkPaths {
+		if strings.Contains(body, p) {
+			t.Errorf("metrics output leaked raw request path %q; expected it to be collapsed to the unmatched label", p)
+		}
+	}
+}

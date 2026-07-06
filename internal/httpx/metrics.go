@@ -59,9 +59,18 @@ func Metrics() func(http.Handler) http.Handler {
 	}
 }
 
+// unmatchedRouteLabel is the "path" label value used for requests that did
+// not match any registered chi route (e.g. 404s on arbitrary/junk paths).
+// Labeling with the raw, client-controlled r.URL.Path instead would let a
+// client generate unbounded Prometheus label cardinality — a memory-growth
+// vector — simply by requesting distinct nonexistent paths. All unmatched
+// requests are collapsed onto this single label value instead.
+const unmatchedRouteLabel = "unmatched"
+
 // routePattern returns the matched chi route pattern (e.g. "/v1/users/{id}")
 // rather than the raw URL path, so metrics cardinality stays bounded
-// regardless of path parameters. Falls back to the raw path if no chi
+// regardless of path parameters. Falls back to the constant
+// unmatchedRouteLabel — never the raw, client-controlled path — if no chi
 // route context is available (e.g. for unmatched/404 requests).
 func routePattern(r *http.Request) string {
 	if rctx := chi.RouteContext(r.Context()); rctx != nil {
@@ -69,5 +78,5 @@ func routePattern(r *http.Request) string {
 			return pattern
 		}
 	}
-	return r.URL.Path
+	return unmatchedRouteLabel
 }
