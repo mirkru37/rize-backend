@@ -27,7 +27,7 @@ deploy-bootstrap-check:
 	@echo "Repo secrets:"
 	@for s in GCP_PROJECT_ID GCP_WIF_PROVIDER GCP_SERVICE_ACCOUNT GCP_REGION \
 	          INTEGRATION_DATABASE_URL_SECRET PRODUCTION_DATABASE_URL_SECRET \
-	          JWT_SIGNING_KEY_SECRET; do \
+	          INTEGRATION_JWT_SIGNING_KEY_SECRET PRODUCTION_JWT_SIGNING_KEY_SECRET; do \
 		if gh secret list --json name -q '.[].name' | grep -qx "$$s"; then \
 			echo "  [x] $$s"; \
 		else \

@@ -5,6 +5,10 @@ on:
     branches:
       - main
 
+concurrency:
+  group: deploy-integration
+  cancel-in-progress: false
+
 permissions:
   contents: read
   id-token: write
@@ -110,6 +114,7 @@ jobs:
             --image="${{ needs.build-and-push.outputs.migrate-image }}:${{ github.sha }}" \
             --region="${{ secrets.GCP_REGION }}" \
             --project="${{ secrets.GCP_PROJECT_ID }}" \
+            --service-account="rize-backend-runtime@${{ secrets.GCP_PROJECT_ID }}.iam.gserviceaccount.com" \
             --set-secrets="DATABASE_URL=${{ secrets.INTEGRATION_DATABASE_URL_SECRET }}" \
             --quiet
 
@@ -145,6 +150,9 @@ jobs:
             --image="${{ needs.build-and-push.outputs.api-image }}:${{ github.sha }}" \
             --region="${{ secrets.GCP_REGION }}" \
             --project="${{ secrets.GCP_PROJECT_ID }}" \
-            --set-env-vars="ENVIRONMENT=${{ env.API_JOB_ENVIRONMENT }},CORS_ALLOWED_ORIGINS=${{ vars.INTEGRATION_CORS_ALLOWED_ORIGINS }}" \
-            --set-secrets="DATABASE_URL=${{ secrets.INTEGRATION_DATABASE_URL_SECRET }},JWT_SIGNING_KEY=${{ secrets.JWT_SIGNING_KEY_SECRET }}" \
+            --service-account="rize-backend-runtime@${{ secrets.GCP_PROJECT_ID }}.iam.gserviceaccount.com" \
+            --allow-unauthenticated \
+            --max-instances=2 \
+            --set-env-vars="^@@^ENVIRONMENT=${{ env.API_JOB_ENVIRONMENT }}@@CORS_ALLOWED_ORIGINS=${{ vars.INTEGRATION_CORS_ALLOWED_ORIGINS }}" \
+            --set-secrets="DATABASE_URL=${{ secrets.INTEGRATION_DATABASE_URL_SECRET }},JWT_SIGNING_KEY=${{ secrets.INTEGRATION_JWT_SIGNING_KEY_SECRET }}" \
             --quiet
