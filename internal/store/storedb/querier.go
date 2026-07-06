@@ -19,8 +19,39 @@ type Querier interface {
 	// the same new bundle_id/platform; a caller that gets zero rows back must
 	// re-fetch via GetAppByBundleID.
 	CreateApp(ctx context.Context, arg CreateAppParams) (App, error)
+	// POST /v1/categories always creates a user-owned category (user_id set to
+	// the authenticated caller); a client cannot create a system default
+	// through this endpoint. id is server-generated (gen_random_uuid()): per
+	// documentation/database-schema.md's PK convention, categories are not in
+	// the client-supplied-UUIDv7 list (only activity_events, focus_sessions,
+	// projects, and tags are).
+	CreateCategoryForUser(ctx context.Context, arg CreateCategoryForUserParams) (Category, error)
 	CreateDevice(ctx context.Context, arg CreateDeviceParams) (Device, error)
+	// POST /v1/focus-sessions per documentation/api-reference.md §CRUD groups.
+	// id is caller-supplied (client-supplied-UUIDv7 entity per
+	// documentation/database-schema.md's PK convention, same as
+	// internal/sync's push-side UpsertFocusSession). device_id and project_id
+	// are validated by the caller (internal/focussessions's service) against
+	// the authenticated user before this INSERT runs, per
+	// documentation/security.md §Tenant Isolation — device_id is NOT NULL on
+	// this table (see documentation/database-schema.md's focus_sessions),
+	// so a caller must resolve a device it owns first.
+	CreateFocusSessionForUser(ctx context.Context, arg CreateFocusSessionForUserParams) (FocusSession, error)
+	// Creates a project owned by the authenticated user, per
+	// documentation/api-reference.md §CRUD groups ("POST /v1/projects"). id is
+	// supplied by the caller (see internal/projects's uuid handling): per
+	// documentation/database-schema.md's PK convention, projects are a
+	// client-supplied-UUIDv7 entity like tags/focus_sessions, whether the row
+	// originates from a sync push or a direct REST create — this query does
+	// not itself generate one.
+	CreateProjectForUser(ctx context.Context, arg CreateProjectForUserParams) (Project, error)
 	CreateRefreshToken(ctx context.Context, arg CreateRefreshTokenParams) (RefreshToken, error)
+	// Creates a tag owned by the authenticated user, per
+	// documentation/api-reference.md §CRUD groups ("POST /v1/tags"). A
+	// concurrent/duplicate name for the same user surfaces as a unique
+	// violation on tags' UNIQUE (user_id, name) constraint, mapped by the
+	// caller via store.ConstraintViolation to a 409 Conflict.
+	CreateTagForUser(ctx context.Context, arg CreateTagForUserParams) (Tag, error)
 	// Callers pass the desired role explicitly ('user' by default); the
 	// database-side DEFAULT 'user' on this column only applies when the column
 	// is omitted from an INSERT's column list, which sqlc's generated,
@@ -37,6 +68,9 @@ type Querier interface {
 	// `apps`. Not user-scoped: the catalog is global/cross-user by design (see
 	// documentation/architecture-backend.md §Ingestion Pipeline, stage 2).
 	GetAppByBundleID(ctx context.Context, arg GetAppByBundleIDParams) (App, error)
+	// GET /v1/categories/{id}: readable if it's a system default or the
+	// caller's own, per database-schema.md's categories.user_id semantics.
+	GetCategoryForUser(ctx context.Context, arg GetCategoryForUserParams) (Category, error)
 	// Scoped by user_id per documentation/security.md §Tenant Isolation: every
 	// query is scoped by user_id from the access token, so a request
 	// authenticated as one user can never read another user's device row.
@@ -47,6 +81,18 @@ type Querier interface {
 	// violation, reported as "invalid") from a same-user last-write-wins loss
 	// (reported as "duplicate") — see internal/sync's push service.
 	GetFocusSessionByID(ctx context.Context, id pgtype.UUID) (FocusSession, error)
+	// Tenant-scoped lookup for GET /v1/focus-sessions/{id} and as the
+	// authorization check before PATCH/DELETE. Zero rows for either "no such
+	// session" or "belongs to another user," reported identically as 404.
+	GetFocusSessionForUser(ctx context.Context, arg GetFocusSessionForUserParams) (FocusSession, error)
+	// Authorization check used before UPDATE/DELETE: unlike GetCategoryForUser,
+	// this only matches a category the caller owns (user_id = $2), never a
+	// system default (user_id IS NULL). System categories are read-only via
+	// the API — see internal/categories's service doc comment for why an
+	// attempt to PATCH/DELETE one is reported as 404 rather than 403, matching
+	// the cross-tenant 404-equivalence convention used elsewhere in this
+	// ticket.
+	GetOwnCategoryForUser(ctx context.Context, arg GetOwnCategoryForUserParams) (Category, error)
 	// Tenant-scoped existence check for a client-supplied focus_session
 	// project_id, per documentation/security.md §Tenant Isolation: a project_id
 	// is only accepted if it both exists and belongs to the authenticated
@@ -56,6 +102,16 @@ type Querier interface {
 	// so the caller cannot distinguish "doesn't exist" from "not yours" and
 	// leak the other tenant's project existence.
 	GetProjectByIDForUser(ctx context.Context, arg GetProjectByIDForUserParams) (Project, error)
+	// Tenant-scoped lookup for GET /v1/projects/{id}, and the authorization
+	// check before PATCH/DELETE. Unlike sync.sql's GetProjectByIDForUser (used
+	// by the push path to validate a focus_session's project_id reference,
+	// where a soft-deleted project should arguably still resolve — that
+	// existing behavior is out of scope for this ticket and left unchanged),
+	// this query excludes soft-deleted rows: a deleted project must read back
+	// as 404, matching documentation/database-schema.md's soft-delete
+	// convention and this ticket's cross-tenant/deleted 404-equivalence
+	// convention.
+	GetProjectForUser(ctx context.Context, arg GetProjectForUserParams) (Project, error)
 	GetRefreshTokenByHash(ctx context.Context, tokenHash []byte) (RefreshToken, error)
 	// Blocking row lock, used only after GetRefreshTokenByHashForUpdateNoWait
 	// has detected contention: waits for the concurrently in-flight rotation to
@@ -67,6 +123,11 @@ type Querier interface {
 	// this exact token" from "I am the only one looking at this row right now",
 	// per documentation/security.md's refresh-rotation flow (RIZ-32 M2).
 	GetRefreshTokenByHashForUpdateNoWait(ctx context.Context, tokenHash []byte) (RefreshToken, error)
+	// Tenant-scoped lookup for GET /v1/tags/{id}. Zero rows for either "no
+	// such tag" or "belongs to another user," per
+	// documentation/security.md §Tenant Isolation, so the two cases are
+	// reported identically as 404.
+	GetTagForUser(ctx context.Context, arg GetTagForUserParams) (Tag, error)
 	// The user-specific override consulted by category resolution's first
 	// fallback step, per documentation/architecture-backend.md §Ingestion
 	// Pipeline stage 3. Scoped by user_id per documentation/security.md
@@ -85,7 +146,55 @@ type Querier interface {
 	// request body) per documentation/security.md §Tenant Isolation.
 	InsertActivityEvent(ctx context.Context, arg InsertActivityEventParams) (ActivityEvent, error)
 	ListActiveRefreshTokensByUser(ctx context.Context, userID pgtype.UUID) ([]RefreshToken, error)
+	// One page of GET /v1/sync/changes's "activity_events" entity, per
+	// documentation/sync-protocol.md §Pull. Scoped by user_id per
+	// documentation/security.md §Tenant Isolation; ordered by the global
+	// server_seq sequence (migration 000021/000022) for strict keyset
+	// pagination. $3 is the caller-requested page size PLUS ONE (see
+	// internal/sync's pull service), so the caller can detect "more rows
+	// exist beyond this page" without a second round trip. app_bundle_id and
+	// category_name are resolved via LEFT JOIN so a null app_id/category_id
+	// (never yet resolved) doesn't drop the row, matching
+	// documentation/sync-protocol.md's upsert shape
+	// ({"app_bundle_id": ..., "category": ...}).
+	ListActivityEventChangesForUser(ctx context.Context, arg ListActivityEventChangesForUserParams) ([]ListActivityEventChangesForUserRow, error)
+	// GET /v1/categories per documentation/api-reference.md §CRUD groups.
+	// documentation/database-schema.md's categories table: "user_id IS NULL
+	// denotes a system default category available to every user; user_id set
+	// denotes a user's own custom category" — so the list a user sees is the
+	// union of every system default plus their own custom categories,
+	// keyset-paginated together by server_seq.
+	ListCategoriesForUser(ctx context.Context, arg ListCategoriesForUserParams) ([]Category, error)
 	ListDevicesByUser(ctx context.Context, userID pgtype.UUID) ([]Device, error)
+	// One page of GET /v1/sync/changes's "focus_sessions" entity. See
+	// ListActivityEventChangesForUser's doc comment for the pagination and
+	// tenant-scoping rationale, which applies identically here.
+	ListFocusSessionChangesForUser(ctx context.Context, arg ListFocusSessionChangesForUserParams) ([]ListFocusSessionChangesForUserRow, error)
+	// Keyset-paginated list for GET /v1/focus-sessions, per
+	// documentation/api-reference.md §Conventions. Scoped by user_id per
+	// documentation/security.md §Tenant Isolation; excludes soft-deleted rows.
+	ListFocusSessionsForUser(ctx context.Context, arg ListFocusSessionsForUserParams) ([]FocusSession, error)
+	// One page of GET /v1/sync/changes's "projects" entity.
+	ListProjectChangesForUser(ctx context.Context, arg ListProjectChangesForUserParams) ([]ListProjectChangesForUserRow, error)
+	// Keyset-paginated list for GET /v1/projects, per
+	// documentation/api-reference.md §Conventions ("list endpoints ... use a
+	// cursor-based convention"). Soft-deleted rows are excluded: a CRUD list is
+	// "your current projects," not the sync tombstone stream (GET
+	// /v1/sync/changes serves that). Scoped by user_id per
+	// documentation/security.md §Tenant Isolation.
+	ListProjectsForUser(ctx context.Context, arg ListProjectsForUserParams) ([]Project, error)
+	// One page of GET /v1/sync/changes's "tags" entity.
+	ListTagChangesForUser(ctx context.Context, arg ListTagChangesForUserParams) ([]ListTagChangesForUserRow, error)
+	// Keyset-paginated list for GET /v1/tags, per
+	// documentation/api-reference.md §Conventions. Scoped by user_id per
+	// documentation/security.md §Tenant Isolation; excludes soft-deleted rows.
+	ListTagsForUser(ctx context.Context, arg ListTagsForUserParams) ([]Tag, error)
+	// One page of GET /v1/sync/changes's "user_app_settings" entity.
+	// user_app_settings has no deleted_at/deleted column (see
+	// documentation/database-schema.md), so every row from this query is an
+	// upsert; internal/sync's pull service always reports an empty
+	// "tombstones" array for this entity type.
+	ListUserAppSettingChangesForUser(ctx context.Context, arg ListUserAppSettingChangesForUserParams) ([]UserAppSetting, error)
 	// Scoped by user_id per documentation/security.md §Tenant Isolation.
 	RevokeDevice(ctx context.Context, arg RevokeDeviceParams) error
 	RevokeRefreshTokenFamily(ctx context.Context, familyID pgtype.UUID) error
@@ -99,6 +208,25 @@ type Querier interface {
 	// documentation/security.md §Token model.
 	RevokeRefreshTokensByDevice(ctx context.Context, arg RevokeRefreshTokensByDeviceParams) error
 	RotateRefreshToken(ctx context.Context, arg RotateRefreshTokenParams) (RefreshToken, error)
+	// DELETE /v1/focus-sessions/{id}. Soft delete via deleted_at so the
+	// deletion propagates as a tombstone through GET /v1/sync/changes.
+	SoftDeleteFocusSessionForUser(ctx context.Context, arg SoftDeleteFocusSessionForUserParams) (int64, error)
+	// DELETE /v1/categories/{id}, restricted to categories the caller owns; a
+	// system default cannot be deleted through this query (zero rows if id
+	// resolves to one).
+	SoftDeleteOwnCategoryForUser(ctx context.Context, arg SoftDeleteOwnCategoryForUserParams) (int64, error)
+	// DELETE /v1/projects/{id}. Soft delete via deleted_at per
+	// documentation/database-schema.md's "Soft delete via deleted_at"
+	// convention, so the deletion propagates to other devices as a tombstone
+	// through GET /v1/sync/changes. Scoped by user_id per
+	// documentation/security.md §Tenant Isolation; the returned row count lets
+	// the caller distinguish "already deleted / not yours / doesn't exist"
+	// (0 rows) from a successful delete (1 row), all reported identically as
+	// 404 to avoid leaking cross-tenant existence.
+	SoftDeleteProjectForUser(ctx context.Context, arg SoftDeleteProjectForUserParams) (int64, error)
+	// DELETE /v1/tags/{id}. See projects.sql's SoftDeleteProjectForUser doc
+	// comment for the soft-delete/tombstone and 404-equivalence rationale.
+	SoftDeleteTagForUser(ctx context.Context, arg SoftDeleteTagForUserParams) (int64, error)
 	// server_seq is bumped by the users_set_server_seq BEFORE UPDATE trigger
 	// (see migration 000022).
 	SoftDeleteUser(ctx context.Context, id pgtype.UUID) error
@@ -126,6 +254,30 @@ type Querier interface {
 	// PATCH /v1/devices/{id} ("Rename a device" per documentation/api-reference.md
 	// §Devices).
 	UpdateDeviceName(ctx context.Context, arg UpdateDeviceNameParams) (Device, error)
+	// PATCH /v1/focus-sessions/{id}. See queries/projects.sql's
+	// UpdateProjectForUser doc comment for the read-then-merge-then-write
+	// pattern and the updated_at rationale (server sets updated_at = now();
+	// this is a direct REST edit, not a push-path LWW write).
+	UpdateFocusSessionForUser(ctx context.Context, arg UpdateFocusSessionForUserParams) (FocusSession, error)
+	// PATCH /v1/categories/{id}, restricted to categories the caller owns (see
+	// GetOwnCategoryForUser); a system default cannot be edited through this
+	// query (zero rows if id resolves to one).
+	UpdateOwnCategoryForUser(ctx context.Context, arg UpdateOwnCategoryForUserParams) (Category, error)
+	// Partial update for PATCH /v1/projects/{id}. The service layer reads the
+	// current row first and merges caller-supplied fields onto it (matching
+	// internal/auth.UpdateProfile's pattern), so every column here is always
+	// the final, already-merged value rather than a SQL-side COALESCE.
+	// updated_at is always set to the server's now() — direct REST edits are
+	// not subject to the client-supplied-updated_at LWW comparison
+	// documentation/sync-protocol.md defines for the push path; the
+	// server_seq bump (migration 000022's trigger) is what a later sync pull
+	// propagates to other devices, and any device that later pushes an older
+	// focus_session/project/tag write than this REST edit's new updated_at
+	// correctly loses the LWW comparison.
+	UpdateProjectForUser(ctx context.Context, arg UpdateProjectForUserParams) (Project, error)
+	// PATCH /v1/tags/{id}. See projects.sql's UpdateProjectForUser doc comment
+	// for the read-then-merge-then-write pattern and the updated_at rationale.
+	UpdateTagForUser(ctx context.Context, arg UpdateTagForUserParams) (Tag, error)
 	// server_seq is bumped by the users_set_server_seq BEFORE UPDATE trigger
 	// (see migration 000022), which draws from the same server_seq_global
 	// sequence used by inserts, per documentation/sync-protocol.md. Callers no

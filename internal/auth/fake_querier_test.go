@@ -185,6 +185,10 @@ func (f *fakeQuerier) GetProjectByIDForUser(context.Context, storedb.GetProjectB
 	return storedb.Project{}, errNotImplementedByFakeQuerier
 }
 
+func (f *fakeQuerier) GetProjectForUser(context.Context, storedb.GetProjectForUserParams) (storedb.Project, error) {
+	return storedb.Project{}, errNotImplementedByFakeQuerier
+}
+
 func (f *fakeQuerier) GetUserAppSettingByUserAndApp(context.Context, storedb.GetUserAppSettingByUserAndAppParams) (storedb.UserAppSetting, error) {
 	return storedb.UserAppSetting{}, errNotImplementedByFakeQuerier
 }
@@ -199,6 +203,110 @@ func (f *fakeQuerier) TombstoneActivityEvent(context.Context, storedb.TombstoneA
 
 func (f *fakeQuerier) UpsertFocusSession(context.Context, storedb.UpsertFocusSessionParams) (storedb.FocusSession, error) {
 	return storedb.FocusSession{}, errNotImplementedByFakeQuerier
+}
+
+// The internal/projects, internal/tags, internal/categories,
+// internal/focussessions, and RIZ-34 pull-side Querier methods below are
+// likewise not exercised by any internal/auth test; they exist only so
+// *fakeQuerier continues to satisfy storedb.Querier.
+func (f *fakeQuerier) CreateCategoryForUser(context.Context, storedb.CreateCategoryForUserParams) (storedb.Category, error) {
+	return storedb.Category{}, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) CreateFocusSessionForUser(context.Context, storedb.CreateFocusSessionForUserParams) (storedb.FocusSession, error) {
+	return storedb.FocusSession{}, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) CreateProjectForUser(context.Context, storedb.CreateProjectForUserParams) (storedb.Project, error) {
+	return storedb.Project{}, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) CreateTagForUser(context.Context, storedb.CreateTagForUserParams) (storedb.Tag, error) {
+	return storedb.Tag{}, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) GetCategoryForUser(context.Context, storedb.GetCategoryForUserParams) (storedb.Category, error) {
+	return storedb.Category{}, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) GetFocusSessionForUser(context.Context, storedb.GetFocusSessionForUserParams) (storedb.FocusSession, error) {
+	return storedb.FocusSession{}, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) GetOwnCategoryForUser(context.Context, storedb.GetOwnCategoryForUserParams) (storedb.Category, error) {
+	return storedb.Category{}, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) GetTagForUser(context.Context, storedb.GetTagForUserParams) (storedb.Tag, error) {
+	return storedb.Tag{}, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) ListActivityEventChangesForUser(context.Context, storedb.ListActivityEventChangesForUserParams) ([]storedb.ListActivityEventChangesForUserRow, error) {
+	return nil, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) ListCategoriesForUser(context.Context, storedb.ListCategoriesForUserParams) ([]storedb.Category, error) {
+	return nil, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) ListFocusSessionChangesForUser(context.Context, storedb.ListFocusSessionChangesForUserParams) ([]storedb.ListFocusSessionChangesForUserRow, error) {
+	return nil, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) ListFocusSessionsForUser(context.Context, storedb.ListFocusSessionsForUserParams) ([]storedb.FocusSession, error) {
+	return nil, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) ListProjectChangesForUser(context.Context, storedb.ListProjectChangesForUserParams) ([]storedb.ListProjectChangesForUserRow, error) {
+	return nil, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) ListProjectsForUser(context.Context, storedb.ListProjectsForUserParams) ([]storedb.Project, error) {
+	return nil, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) ListTagChangesForUser(context.Context, storedb.ListTagChangesForUserParams) ([]storedb.ListTagChangesForUserRow, error) {
+	return nil, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) ListTagsForUser(context.Context, storedb.ListTagsForUserParams) ([]storedb.Tag, error) {
+	return nil, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) ListUserAppSettingChangesForUser(context.Context, storedb.ListUserAppSettingChangesForUserParams) ([]storedb.UserAppSetting, error) {
+	return nil, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) SoftDeleteFocusSessionForUser(context.Context, storedb.SoftDeleteFocusSessionForUserParams) (int64, error) {
+	return 0, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) SoftDeleteOwnCategoryForUser(context.Context, storedb.SoftDeleteOwnCategoryForUserParams) (int64, error) {
+	return 0, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) SoftDeleteProjectForUser(context.Context, storedb.SoftDeleteProjectForUserParams) (int64, error) {
+	return 0, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) SoftDeleteTagForUser(context.Context, storedb.SoftDeleteTagForUserParams) (int64, error) {
+	return 0, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) UpdateFocusSessionForUser(context.Context, storedb.UpdateFocusSessionForUserParams) (storedb.FocusSession, error) {
+	return storedb.FocusSession{}, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) UpdateOwnCategoryForUser(context.Context, storedb.UpdateOwnCategoryForUserParams) (storedb.Category, error) {
+	return storedb.Category{}, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) UpdateProjectForUser(context.Context, storedb.UpdateProjectForUserParams) (storedb.Project, error) {
+	return storedb.Project{}, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) UpdateTagForUser(context.Context, storedb.UpdateTagForUserParams) (storedb.Tag, error) {
+	return storedb.Tag{}, errNotImplementedByFakeQuerier
 }
 
 func (f *fakeQuerier) GetUserByAppleUserID(_ context.Context, appleUserID *string) (storedb.User, error) {
