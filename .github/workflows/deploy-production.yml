@@ -1,0 +1,158 @@
+name: Deploy Production
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AR_REPO: rize-backend
+
+jobs:
+  # Guard job: runs unconditionally and first. If the repo has not been
+  # GCP-bootstrapped yet (no GCP_PROJECT_ID secret), it logs a clear message
+  # and exits 0 so publishing a release never fails CI pre-bootstrap. All
+  # later jobs are gated on its `configured` output.
+  guard:
+    name: Guard - GCP bootstrap check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      configured: ${{ steps.check.outputs.configured }}
+    steps:
+      - name: Check GCP_PROJECT_ID secret
+        id: check
+        env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+        run: |
+          if [ -z "${GCP_PROJECT_ID}" ]; then
+            echo "deploy skipped — GCP not bootstrapped (GCP_PROJECT_ID secret unset). See docs/deployment.md for the bootstrap procedure."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "GCP_PROJECT_ID is set — proceeding with production deploy."
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  resolve-image:
+    name: Resolve release commit and verify integration build exists
+    needs: guard
+    if: needs.guard.outputs.configured == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      api-image: ${{ steps.resolve.outputs.api-image }}
+      migrate-image: ${{ steps.resolve.outputs.migrate-image }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
+
+      - id: auth
+        name: Authenticate to Google Cloud (Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Resolve release target commit SHA
+        id: resolve
+        run: |
+          SHA="$(git rev-parse HEAD)"
+          API_IMAGE="${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${AR_REPO}/api"
+          MIGRATE_IMAGE="${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${AR_REPO}/migrate"
+          echo "Release ${{ github.event.release.tag_name }} resolves to commit ${SHA}"
+          {
+            echo "sha=${SHA}"
+            echo "api-image=${API_IMAGE}"
+            echo "migrate-image=${MIGRATE_IMAGE}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify integration build exists for this commit
+        run: |
+          set -e
+          if ! gcloud artifacts docker images describe \
+              "${{ steps.resolve.outputs.api-image }}:${{ steps.resolve.outputs.sha }}" \
+              --project="${{ secrets.GCP_PROJECT_ID }}" >/dev/null 2>&1; then
+            echo "::error::No integration build found for commit ${{ steps.resolve.outputs.sha }} at ${{ steps.resolve.outputs.api-image }}:${{ steps.resolve.outputs.sha }}. The deploy-integration workflow must have built and pushed an image for this exact commit (via a push to main) before a release targeting it can be promoted to production. Merge/land this commit on main first, wait for deploy-integration to succeed, then re-publish the release."
+            exit 1
+          fi
+          if ! gcloud artifacts docker images describe \
+              "${{ steps.resolve.outputs.migrate-image }}:${{ steps.resolve.outputs.sha }}" \
+              --project="${{ secrets.GCP_PROJECT_ID }}" >/dev/null 2>&1; then
+            echo "::error::No integration migration image found for commit ${{ steps.resolve.outputs.sha }} at ${{ steps.resolve.outputs.migrate-image }}:${{ steps.resolve.outputs.sha }}. See deploy-integration.yml — this image is built together with the API image."
+            exit 1
+          fi
+
+  migrate:
+    name: Run production DB migrations
+    needs: [guard, resolve-image]
+    if: needs.guard.outputs.configured == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - id: auth
+        name: Authenticate to Google Cloud (Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Deploy migration Cloud Run Job
+        run: |
+          gcloud run jobs deploy rize-backend-migrate-production \
+            --image="${{ needs.resolve-image.outputs.migrate-image }}:${{ needs.resolve-image.outputs.sha }}" \
+            --region="${{ secrets.GCP_REGION }}" \
+            --project="${{ secrets.GCP_PROJECT_ID }}" \
+            --set-secrets="DATABASE_URL=${{ secrets.PRODUCTION_DATABASE_URL_SECRET }}" \
+            --quiet
+
+      - name: Execute migration job and wait for completion
+        run: |
+          gcloud run jobs execute rize-backend-migrate-production \
+            --region="${{ secrets.GCP_REGION }}" \
+            --project="${{ secrets.GCP_PROJECT_ID }}" \
+            --wait
+
+  deploy:
+    name: Deploy Cloud Run service
+    needs: [guard, resolve-image, migrate]
+    if: needs.guard.outputs.configured == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - id: auth
+        name: Authenticate to Google Cloud (Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Deploy rize-backend-production
+        run: |
+          gcloud run deploy rize-backend-production \
+            --image="${{ needs.resolve-image.outputs.api-image }}:${{ needs.resolve-image.outputs.sha }}" \
+            --region="${{ secrets.GCP_REGION }}" \
+            --project="${{ secrets.GCP_PROJECT_ID }}" \
+            --set-env-vars="ENVIRONMENT=production,CORS_ALLOWED_ORIGINS=${{ vars.PRODUCTION_CORS_ALLOWED_ORIGINS }}" \
+            --set-secrets="DATABASE_URL=${{ secrets.PRODUCTION_DATABASE_URL_SECRET }},JWT_SIGNING_KEY=${{ secrets.JWT_SIGNING_KEY_SECRET }}" \
+            --quiet
