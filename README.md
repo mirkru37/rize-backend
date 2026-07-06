@@ -47,7 +47,7 @@ cp .env.example .env
 `internal/config/env_example_test.go` enforces that `.env.example` stays complete: it fails if `config.Load()` reads a variable that `.env.example` doesn't document.
 
 - **Running the binary on the host** (`go run ./cmd/api`): the process does not auto-load `.env` (no dotenv library is wired in), so export the variables into your shell first, e.g. `set -a && source .env && set +a`.
-- **`docker compose up`**: the `api` service in `docker-compose.yml` currently hardcodes only `PORT` and `DATABASE_URL` in its `environment:` block — it does not read `.env` via an `env_file:` directive, so other variables (e.g. `JWT_SIGNING_KEY`, `CORS_ALLOWED_ORIGINS`) are not picked up by compose today. Add an `env_file: .env` line to the `api` service (or extend its `environment:` block) if you need those set when running under compose.
+- **`docker compose up`**: the `api` service reads `.env` if present, via `env_file: { path: .env, required: false }` — so `JWT_SIGNING_KEY`, `CORS_ALLOWED_ORIGINS`, and other variables from a copied `.env` are picked up by compose. `PORT` and `DATABASE_URL` are still set explicitly in the `environment:` block, and compose gives `environment:` precedence over `env_file:`, so those two stay compose-overridden by design — the container needs `PORT=8080` and the container-network `DATABASE_URL` (host `db`), not a localhost DSN from a host-oriented `.env`.
 
 ## Documentation
 
