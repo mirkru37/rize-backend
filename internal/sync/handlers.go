@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 
 	"github.com/mirkru37/rize-backend/internal/auth"
 	"github.com/mirkru37/rize-backend/internal/httpx"
@@ -46,6 +47,37 @@ func (h *Handler) PushEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp, err := h.Service.push(r.Context(), identity.UserID, req)
+	if err != nil {
+		writeServiceError(w, r, err)
+		return
+	}
+
+	httpx.WriteJSON(w, r, http.StatusOK, resp)
+}
+
+// PullChanges handles GET /v1/sync/changes, per
+// documentation/sync-protocol.md §Pull and documentation/api-reference.md
+// §Sync.
+func (h *Handler) PullChanges(w http.ResponseWriter, r *http.Request) {
+	identity, ok := auth.IdentityFromContext(r.Context())
+	if !ok {
+		httpx.WriteError(w, r, http.StatusUnauthorized, errNS+"unauthenticated", "Unauthenticated", "A valid access token is required.")
+		return
+	}
+
+	cursor := r.URL.Query().Get("cursor")
+
+	limit := 0
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 {
+			httpx.WriteError(w, r, http.StatusBadRequest, errNS+"validation-error", "Validation Error", "limit must be a positive integer.")
+			return
+		}
+		limit = parsed
+	}
+
+	resp, err := h.Service.pull(r.Context(), identity.UserID, cursor, limit)
 	if err != nil {
 		writeServiceError(w, r, err)
 		return

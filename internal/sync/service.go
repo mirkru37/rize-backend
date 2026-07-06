@@ -79,6 +79,15 @@ var platformSource = map[string]string{
 type Service struct {
 	Queries storedb.Querier
 
+	// Pool runs GET /v1/sync/changes's per-entity-type queries inside a
+	// single REPEATABLE READ, READ ONLY transaction (see pull.go's
+	// runInPullSnapshot) so they all observe one fixed MVCC snapshot — the
+	// RIZ-34 H1 fix for server_seq's non-commit-ordered assignment. It must
+	// be set to a real *pgxpool.Pool in production (cmd/api/main.go). A nil
+	// Pool (e.g. a hand-built unit-test Service) falls back to running
+	// those queries directly against Queries, non-transactionally.
+	Pool Beginner
+
 	// now is overridable in tests to exercise clock-skew handling
 	// deterministically; defaults to time.Now when nil.
 	now func() time.Time
