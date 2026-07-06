@@ -24,7 +24,7 @@ SELECT
 FROM activity_events ae
 LEFT JOIN apps a ON a.id = ae.app_id
 LEFT JOIN categories c ON c.id = ae.category_id
-WHERE ae.user_id = $1 AND ae.server_seq > $2
+WHERE ae.user_id = $1 AND ae.server_seq > $2 AND xid_before_snapshot_horizon(ae.xmin)
 ORDER BY ae.server_seq ASC
 LIMIT $3
 `
@@ -57,6 +57,20 @@ type ListActivityEventChangesForUserRow struct {
 // (never yet resolved) doesn't drop the row, matching
 // documentation/sync-protocol.md's upsert shape
 // ({"app_bundle_id": ..., "category": ...}).
+//
+// xid_before_snapshot_horizon(ae.xmin) (migration 000024) gates delivery
+// on the pulling transaction's MVCC snapshot horizon rather than trusting
+// server_seq alone: nextval()-assigned server_seq is not commit-ordered,
+// so a row from an as-yet-uncommitted transaction can carry a LOWER
+// server_seq than one this pull is about to deliver. Excluding any row
+// whose xmin isn't safely before every in-flight transaction as of this
+// pull's snapshot means next_cursor (computed in internal/sync/pull.go)
+// never advances past a row that could still be uncommitted — see
+// migration 000024's comment for the full invariant and the widening
+// math. This query MUST run inside the same REPEATABLE READ transaction
+// as every other pull query in the same request (internal/sync's pull
+// service opens it), so pg_current_snapshot() resolves to one stable
+// snapshot across all of them.
 func (q *Queries) ListActivityEventChangesForUser(ctx context.Context, arg ListActivityEventChangesForUserParams) ([]ListActivityEventChangesForUserRow, error) {
 	rows, err := q.db.Query(ctx, listActivityEventChangesForUser, arg.UserID, arg.ServerSeq, arg.Limit)
 	if err != nil {
@@ -86,11 +100,74 @@ func (q *Queries) ListActivityEventChangesForUser(ctx context.Context, arg ListA
 	return items, nil
 }
 
+const listCategoryChangesForUser = `-- name: ListCategoryChangesForUser :many
+SELECT id, user_id, name, color, productivity, updated_at, deleted_at, server_seq
+FROM categories
+WHERE (user_id = $1 OR user_id IS NULL) AND server_seq > $2 AND xid_before_snapshot_horizon(xmin)
+ORDER BY server_seq ASC
+LIMIT $3
+`
+
+type ListCategoryChangesForUserParams struct {
+	UserID    pgtype.UUID `json:"user_id"`
+	ServerSeq int64       `json:"server_seq"`
+	Limit     int32       `json:"limit"`
+}
+
+type ListCategoryChangesForUserRow struct {
+	ID           pgtype.UUID        `json:"id"`
+	UserID       pgtype.UUID        `json:"user_id"`
+	Name         string             `json:"name"`
+	Color        string             `json:"color"`
+	Productivity int16              `json:"productivity"`
+	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+	DeletedAt    pgtype.Timestamptz `json:"deleted_at"`
+	ServerSeq    int64              `json:"server_seq"`
+}
+
+// One page of GET /v1/sync/changes's "categories" entity (RIZ-34 M1).
+// database-schema.md states server_seq-based keyset pagination applies to
+// categories exactly like every other syncable table; scoping mirrors
+// internal/store/queries/categories.sql's ListCategoriesForUser: a user's
+// pull sees the union of every system default category (user_id IS NULL)
+// plus their own custom categories (user_id = $1), so a client can resolve
+// every category_id it might see on an activity_event/user_app_setting
+// row. See ListActivityEventChangesForUser's doc comment for the
+// xmin-horizon rationale.
+func (q *Queries) ListCategoryChangesForUser(ctx context.Context, arg ListCategoryChangesForUserParams) ([]ListCategoryChangesForUserRow, error) {
+	rows, err := q.db.Query(ctx, listCategoryChangesForUser, arg.UserID, arg.ServerSeq, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListCategoryChangesForUserRow
+	for rows.Next() {
+		var i ListCategoryChangesForUserRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.Name,
+			&i.Color,
+			&i.Productivity,
+			&i.UpdatedAt,
+			&i.DeletedAt,
+			&i.ServerSeq,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listFocusSessionChangesForUser = `-- name: ListFocusSessionChangesForUser :many
 SELECT id, project_id, kind, planned_duration_s, started_at, ended_at,
        status, note, updated_at, deleted_at, server_seq
 FROM focus_sessions
-WHERE user_id = $1 AND server_seq > $2
+WHERE user_id = $1 AND server_seq > $2 AND xid_before_snapshot_horizon(xmin)
 ORDER BY server_seq ASC
 LIMIT $3
 `
@@ -116,8 +193,9 @@ type ListFocusSessionChangesForUserRow struct {
 }
 
 // One page of GET /v1/sync/changes's "focus_sessions" entity. See
-// ListActivityEventChangesForUser's doc comment for the pagination and
-// tenant-scoping rationale, which applies identically here.
+// ListActivityEventChangesForUser's doc comment for the pagination,
+// tenant-scoping, and xmin-horizon rationale, which applies identically
+// here.
 func (q *Queries) ListFocusSessionChangesForUser(ctx context.Context, arg ListFocusSessionChangesForUserParams) ([]ListFocusSessionChangesForUserRow, error) {
 	rows, err := q.db.Query(ctx, listFocusSessionChangesForUser, arg.UserID, arg.ServerSeq, arg.Limit)
 	if err != nil {
@@ -153,7 +231,7 @@ func (q *Queries) ListFocusSessionChangesForUser(ctx context.Context, arg ListFo
 const listProjectChangesForUser = `-- name: ListProjectChangesForUser :many
 SELECT id, name, color, archived_at, updated_at, deleted_at, server_seq
 FROM projects
-WHERE user_id = $1 AND server_seq > $2
+WHERE user_id = $1 AND server_seq > $2 AND xid_before_snapshot_horizon(xmin)
 ORDER BY server_seq ASC
 LIMIT $3
 `
@@ -174,7 +252,9 @@ type ListProjectChangesForUserRow struct {
 	ServerSeq  int64              `json:"server_seq"`
 }
 
-// One page of GET /v1/sync/changes's "projects" entity.
+// One page of GET /v1/sync/changes's "projects" entity. See
+// ListActivityEventChangesForUser's doc comment for the xmin-horizon
+// rationale.
 func (q *Queries) ListProjectChangesForUser(ctx context.Context, arg ListProjectChangesForUserParams) ([]ListProjectChangesForUserRow, error) {
 	rows, err := q.db.Query(ctx, listProjectChangesForUser, arg.UserID, arg.ServerSeq, arg.Limit)
 	if err != nil {
@@ -206,7 +286,7 @@ func (q *Queries) ListProjectChangesForUser(ctx context.Context, arg ListProject
 const listTagChangesForUser = `-- name: ListTagChangesForUser :many
 SELECT id, name, updated_at, deleted_at, server_seq
 FROM tags
-WHERE user_id = $1 AND server_seq > $2
+WHERE user_id = $1 AND server_seq > $2 AND xid_before_snapshot_horizon(xmin)
 ORDER BY server_seq ASC
 LIMIT $3
 `
@@ -225,7 +305,9 @@ type ListTagChangesForUserRow struct {
 	ServerSeq int64              `json:"server_seq"`
 }
 
-// One page of GET /v1/sync/changes's "tags" entity.
+// One page of GET /v1/sync/changes's "tags" entity. See
+// ListActivityEventChangesForUser's doc comment for the xmin-horizon
+// rationale.
 func (q *Queries) ListTagChangesForUser(ctx context.Context, arg ListTagChangesForUserParams) ([]ListTagChangesForUserRow, error) {
 	rows, err := q.db.Query(ctx, listTagChangesForUser, arg.UserID, arg.ServerSeq, arg.Limit)
 	if err != nil {
@@ -255,7 +337,7 @@ func (q *Queries) ListTagChangesForUser(ctx context.Context, arg ListTagChangesF
 const listUserAppSettingChangesForUser = `-- name: ListUserAppSettingChangesForUser :many
 SELECT user_id, app_id, category_id, excluded, updated_at, server_seq
 FROM user_app_settings
-WHERE user_id = $1 AND server_seq > $2
+WHERE user_id = $1 AND server_seq > $2 AND xid_before_snapshot_horizon(xmin)
 ORDER BY server_seq ASC
 LIMIT $3
 `
@@ -270,7 +352,9 @@ type ListUserAppSettingChangesForUserParams struct {
 // user_app_settings has no deleted_at/deleted column (see
 // documentation/database-schema.md), so every row from this query is an
 // upsert; internal/sync's pull service always reports an empty
-// "tombstones" array for this entity type.
+// "tombstones" array for this entity type. See
+// ListActivityEventChangesForUser's doc comment for the xmin-horizon
+// rationale.
 func (q *Queries) ListUserAppSettingChangesForUser(ctx context.Context, arg ListUserAppSettingChangesForUserParams) ([]UserAppSetting, error) {
 	rows, err := q.db.Query(ctx, listUserAppSettingChangesForUser, arg.UserID, arg.ServerSeq, arg.Limit)
 	if err != nil {

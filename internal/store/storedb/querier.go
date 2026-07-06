@@ -157,6 +157,20 @@ type Querier interface {
 	// (never yet resolved) doesn't drop the row, matching
 	// documentation/sync-protocol.md's upsert shape
 	// ({"app_bundle_id": ..., "category": ...}).
+	//
+	// xid_before_snapshot_horizon(ae.xmin) (migration 000024) gates delivery
+	// on the pulling transaction's MVCC snapshot horizon rather than trusting
+	// server_seq alone: nextval()-assigned server_seq is not commit-ordered,
+	// so a row from an as-yet-uncommitted transaction can carry a LOWER
+	// server_seq than one this pull is about to deliver. Excluding any row
+	// whose xmin isn't safely before every in-flight transaction as of this
+	// pull's snapshot means next_cursor (computed in internal/sync/pull.go)
+	// never advances past a row that could still be uncommitted — see
+	// migration 000024's comment for the full invariant and the widening
+	// math. This query MUST run inside the same REPEATABLE READ transaction
+	// as every other pull query in the same request (internal/sync's pull
+	// service opens it), so pg_current_snapshot() resolves to one stable
+	// snapshot across all of them.
 	ListActivityEventChangesForUser(ctx context.Context, arg ListActivityEventChangesForUserParams) ([]ListActivityEventChangesForUserRow, error)
 	// GET /v1/categories per documentation/api-reference.md §CRUD groups.
 	// documentation/database-schema.md's categories table: "user_id IS NULL
@@ -165,16 +179,29 @@ type Querier interface {
 	// union of every system default plus their own custom categories,
 	// keyset-paginated together by server_seq.
 	ListCategoriesForUser(ctx context.Context, arg ListCategoriesForUserParams) ([]Category, error)
+	// One page of GET /v1/sync/changes's "categories" entity (RIZ-34 M1).
+	// database-schema.md states server_seq-based keyset pagination applies to
+	// categories exactly like every other syncable table; scoping mirrors
+	// internal/store/queries/categories.sql's ListCategoriesForUser: a user's
+	// pull sees the union of every system default category (user_id IS NULL)
+	// plus their own custom categories (user_id = $1), so a client can resolve
+	// every category_id it might see on an activity_event/user_app_setting
+	// row. See ListActivityEventChangesForUser's doc comment for the
+	// xmin-horizon rationale.
+	ListCategoryChangesForUser(ctx context.Context, arg ListCategoryChangesForUserParams) ([]ListCategoryChangesForUserRow, error)
 	ListDevicesByUser(ctx context.Context, userID pgtype.UUID) ([]Device, error)
 	// One page of GET /v1/sync/changes's "focus_sessions" entity. See
-	// ListActivityEventChangesForUser's doc comment for the pagination and
-	// tenant-scoping rationale, which applies identically here.
+	// ListActivityEventChangesForUser's doc comment for the pagination,
+	// tenant-scoping, and xmin-horizon rationale, which applies identically
+	// here.
 	ListFocusSessionChangesForUser(ctx context.Context, arg ListFocusSessionChangesForUserParams) ([]ListFocusSessionChangesForUserRow, error)
 	// Keyset-paginated list for GET /v1/focus-sessions, per
 	// documentation/api-reference.md §Conventions. Scoped by user_id per
 	// documentation/security.md §Tenant Isolation; excludes soft-deleted rows.
 	ListFocusSessionsForUser(ctx context.Context, arg ListFocusSessionsForUserParams) ([]FocusSession, error)
-	// One page of GET /v1/sync/changes's "projects" entity.
+	// One page of GET /v1/sync/changes's "projects" entity. See
+	// ListActivityEventChangesForUser's doc comment for the xmin-horizon
+	// rationale.
 	ListProjectChangesForUser(ctx context.Context, arg ListProjectChangesForUserParams) ([]ListProjectChangesForUserRow, error)
 	// Keyset-paginated list for GET /v1/projects, per
 	// documentation/api-reference.md §Conventions ("list endpoints ... use a
@@ -183,7 +210,9 @@ type Querier interface {
 	// /v1/sync/changes serves that). Scoped by user_id per
 	// documentation/security.md §Tenant Isolation.
 	ListProjectsForUser(ctx context.Context, arg ListProjectsForUserParams) ([]Project, error)
-	// One page of GET /v1/sync/changes's "tags" entity.
+	// One page of GET /v1/sync/changes's "tags" entity. See
+	// ListActivityEventChangesForUser's doc comment for the xmin-horizon
+	// rationale.
 	ListTagChangesForUser(ctx context.Context, arg ListTagChangesForUserParams) ([]ListTagChangesForUserRow, error)
 	// Keyset-paginated list for GET /v1/tags, per
 	// documentation/api-reference.md §Conventions. Scoped by user_id per
@@ -193,7 +222,9 @@ type Querier interface {
 	// user_app_settings has no deleted_at/deleted column (see
 	// documentation/database-schema.md), so every row from this query is an
 	// upsert; internal/sync's pull service always reports an empty
-	// "tombstones" array for this entity type.
+	// "tombstones" array for this entity type. See
+	// ListActivityEventChangesForUser's doc comment for the xmin-horizon
+	// rationale.
 	ListUserAppSettingChangesForUser(ctx context.Context, arg ListUserAppSettingChangesForUserParams) ([]UserAppSetting, error)
 	// Scoped by user_id per documentation/security.md §Tenant Isolation.
 	RevokeDevice(ctx context.Context, arg RevokeDeviceParams) error

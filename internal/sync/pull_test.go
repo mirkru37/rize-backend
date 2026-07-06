@@ -2,12 +2,16 @@ package sync
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/mirkru37/rize-backend/internal/auth"
 	"github.com/mirkru37/rize-backend/internal/store/storedb"
 )
 
@@ -18,12 +22,12 @@ func TestPullTenantIsolation(t *testing.T) {
 	q := storedb.New(pool)
 	userA, deviceA := newUser(t, q)
 	userB, _ := newUser(t, q)
-	svc := &Service{Queries: q}
+	svc := &Service{Queries: q, Pool: pool}
 	ctx := context.Background()
 
 	// userA pushes a project (via direct SQL, mirroring service_test.go's
 	// newProject helper) and a focus_session (via push, which this package
-	// already implements).
+	// already implements), and directly inserts a user-owned category.
 	_ = newProject(t, pool, userA)
 
 	startedAt := time.Now().UTC().Truncate(time.Second)
@@ -35,18 +39,49 @@ func TestPullTenantIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("push (userA fixture): %v", err)
 	}
+	userACategoryID := insertUserCategory(t, pool, userA, randomSuffix(t))
 
 	// userB pulls from the beginning of the stream: it must never see
-	// userA's project or focus_session.
+	// userA's project, focus_session, or own category. It DOES legitimately
+	// see every system default category (user_id IS NULL) — that's not a
+	// leak, per ListCategoryChangesForUser's documented scoping (mirroring
+	// the categories CRUD list's "(user_id = $1 OR user_id IS NULL)") — so
+	// "categories" is checked separately for userA's specific row rather
+	// than asserted empty like every other entity type.
 	resp, err := svc.pull(ctx, userIDString(userB), "", 500)
 	if err != nil {
 		t.Fatalf("pull (userB): %v", err)
 	}
 	for entityType, cs := range resp.Changes {
+		if entityType == "categories" {
+			for _, u := range cs.Upserts {
+				if u.(categoryUpsertDTO).ID == userACategoryID {
+					t.Fatalf("userB's pull leaked userA's own category (cross-tenant leak)")
+				}
+			}
+			continue
+		}
 		if len(cs.Upserts) != 0 {
 			t.Fatalf("userB's pull returned %d upserts for %q, want 0 (cross-tenant leak)", len(cs.Upserts), entityType)
 		}
 	}
+}
+
+// insertUserCategory inserts a user-owned category directly via SQL
+// (mirroring internal/categories/service_test.go's insertSystemCategory,
+// but with user_id set rather than NULL) and returns its id string.
+func insertUserCategory(t *testing.T, pool *pgxpool.Pool, user storedb.User, suffix string) string {
+	t.Helper()
+	ctx := context.Background()
+	idStr := newUUIDv7(t)
+	_, err := pool.Exec(ctx, `
+		INSERT INTO categories (id, user_id, name, color, productivity, created_at, updated_at)
+		VALUES ($1, $2, $3, '#000000', 0, now(), now())`,
+		mustParseUUID(t, idStr), user.ID, fmt.Sprintf("pull-test-category-%s", suffix))
+	if err != nil {
+		t.Fatalf("insert user category: %v", err)
+	}
+	return idStr
 }
 
 // TestPullPagination proves multi-page keyset pagination behaves per
@@ -60,7 +95,7 @@ func TestPullPagination(t *testing.T) {
 	pool := testPool(t)
 	q := storedb.New(pool)
 	user, _ := newUser(t, q)
-	svc := &Service{Queries: q}
+	svc := &Service{Queries: q, Pool: pool}
 	ctx := context.Background()
 
 	const total = 5
@@ -121,7 +156,7 @@ func TestPullTombstoneDelivery(t *testing.T) {
 	pool := testPool(t)
 	q := storedb.New(pool)
 	user, _ := newUser(t, q)
-	svc := &Service{Queries: q}
+	svc := &Service{Queries: q, Pool: pool}
 	ctx := context.Background()
 
 	projectID := newProject(t, pool, user)
@@ -172,7 +207,7 @@ func TestPullEmptyFeed(t *testing.T) {
 	pool := testPool(t)
 	q := storedb.New(pool)
 	user, _ := newUser(t, q)
-	svc := &Service{Queries: q}
+	svc := &Service{Queries: q, Pool: pool}
 	ctx := context.Background()
 
 	resp, err := svc.pull(ctx, userIDString(user), "", 50)
@@ -185,6 +220,15 @@ func TestPullEmptyFeed(t *testing.T) {
 	for entityType, cs := range resp.Changes {
 		if cs.Upserts == nil || cs.Tombstones == nil {
 			t.Fatalf("entity %q has a nil upserts/tombstones slice, want empty non-nil slices", entityType)
+		}
+		// "categories" is the one entity type a brand-new user can
+		// legitimately see rows for with zero writes of their own: every
+		// system default category (user_id IS NULL) is delivered to every
+		// user per ListCategoryChangesForUser's scoping, so a client can
+		// resolve category_id on any activity_event/user_app_setting it
+		// pulls even before it has created a single category itself.
+		if entityType == "categories" {
+			continue
 		}
 		if len(cs.Upserts) != 0 || len(cs.Tombstones) != 0 {
 			t.Fatalf("entity %q has non-empty changes for a brand-new user", entityType)
@@ -199,7 +243,7 @@ func TestPullCursorBoundaryExact(t *testing.T) {
 	pool := testPool(t)
 	q := storedb.New(pool)
 	user, _ := newUser(t, q)
-	svc := &Service{Queries: q}
+	svc := &Service{Queries: q, Pool: pool}
 	ctx := context.Background()
 
 	suffix := randomSuffix(t)
@@ -229,7 +273,7 @@ func TestPullLimitClamping(t *testing.T) {
 	pool := testPool(t)
 	q := storedb.New(pool)
 	user, _ := newUser(t, q)
-	svc := &Service{Queries: q}
+	svc := &Service{Queries: q, Pool: pool}
 	ctx := context.Background()
 
 	// A limit above maxPullLimit must be clamped rather than honored
@@ -264,4 +308,269 @@ func insertTag(t *testing.T, pool *pgxpool.Pool, user storedb.User, suffix strin
 		t.Fatalf("insert tag: %v", err)
 	}
 	return idStr
+}
+
+// TestPullMultiEntityPagination proves pagination across two entity types
+// with different row counts (projects: 3, tags: 7) delivers every row
+// exactly-at-least-once with no skip, and that next_cursor/has_more are
+// computed correctly through the pages where the smaller entity type
+// (projects) has already fully drained while the larger one (tags) still
+// has rows pending — the "one type drains before the other" case M4
+// calls out as untested.
+func TestPullMultiEntityPagination(t *testing.T) {
+	pool := testPool(t)
+	q := storedb.New(pool)
+	user, _ := newUser(t, q)
+	svc := &Service{Queries: q, Pool: pool}
+	ctx := context.Background()
+
+	suffix := randomSuffix(t)
+	const numProjects = 3
+	const numTags = 7
+
+	wantProjects := make(map[string]bool, numProjects)
+	for i := 0; i < numProjects; i++ {
+		wantProjects[newProject(t, pool, user)] = true
+	}
+	wantTags := make(map[string]bool, numTags)
+	for i := 0; i < numTags; i++ {
+		wantTags[insertTag(t, pool, user, suffix, i)] = true
+	}
+
+	seenProjects := map[string]bool{}
+	seenTags := map[string]bool{}
+	cursor := ""
+	hasMore := true
+	pages := 0
+	for hasMore {
+		pages++
+		if pages > numProjects+numTags+2 {
+			t.Fatalf("pull did not converge after %d pages (stuck cursor?)", pages)
+		}
+
+		resp, err := svc.pull(ctx, userIDString(user), cursor, 2)
+		if err != nil {
+			t.Fatalf("pull (page %d): %v", pages, err)
+		}
+		for _, u := range resp.Changes["projects"].Upserts {
+			seenProjects[u.(projectUpsertDTO).ID] = true
+		}
+		for _, u := range resp.Changes["tags"].Upserts {
+			seenTags[u.(tagUpsertDTO).ID] = true
+		}
+		cursor = resp.NextCursor
+		hasMore = resp.HasMore
+	}
+
+	for id := range wantProjects {
+		if !seenProjects[id] {
+			t.Fatalf("project id %s was never delivered across any page", id)
+		}
+	}
+	for id := range wantTags {
+		if !seenTags[id] {
+			t.Fatalf("tag id %s was never delivered across any page", id)
+		}
+	}
+}
+
+// TestPullTamperedCursorReturns400 proves a garbage/tampered cursor value
+// is reported as an RFC 7807 400, never a 500, per M4's callout that this
+// path lacked test coverage.
+func TestPullTamperedCursorReturns400(t *testing.T) {
+	pool := testPool(t)
+	q := storedb.New(pool)
+	user, _ := newUser(t, q)
+	svc := &Service{Queries: q, Pool: pool}
+	h := NewHandler(svc)
+
+	for _, tc := range []struct {
+		name   string
+		cursor string
+	}{
+		{"not base64 at all", "not-valid-base64!!!"},
+		{"valid base64 but non-numeric payload", "Z2FyYmFnZQ"}, // base64url("garbage")
+		{"valid base64, negative number", "LTU"},               // base64url("-5")
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/v1/sync/changes?cursor="+tc.cursor, nil)
+			req = req.WithContext(auth.WithIdentity(req.Context(), auth.Identity{UserID: userIDString(user)}))
+			rec := httptest.NewRecorder()
+
+			h.PullChanges(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
+			}
+			var problem struct {
+				Status int `json:"status"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &problem); err != nil {
+				t.Fatalf("decode problem body %q: %v", rec.Body.String(), err)
+			}
+			if problem.Status != http.StatusBadRequest {
+				t.Fatalf("problem.status = %d, want 400", problem.Status)
+			}
+		})
+	}
+}
+
+// TestPullCategoriesPaginationAndTombstone proves categories (RIZ-34 M1)
+// paginate and tombstone exactly like every other syncable entity: a
+// user-owned category is delivered as an upsert, keyset-paginates across
+// pages without skipping, and a subsequent soft-delete is delivered as a
+// tombstone (never re-delivered as an upsert) once the cursor has advanced
+// past the create.
+func TestPullCategoriesPaginationAndTombstone(t *testing.T) {
+	pool := testPool(t)
+	q := storedb.New(pool)
+	user, _ := newUser(t, q)
+	svc := &Service{Queries: q, Pool: pool}
+	ctx := context.Background()
+
+	suffix := randomSuffix(t)
+	const numCategories = 5
+	wantIDs := make(map[string]bool, numCategories)
+	for i := 0; i < numCategories; i++ {
+		wantIDs[insertUserCategory(t, pool, user, fmt.Sprintf("%s-%d", suffix, i))] = true
+	}
+
+	seen := map[string]bool{}
+	cursor := ""
+	hasMore := true
+	for hasMore {
+		resp, err := svc.pull(ctx, userIDString(user), cursor, 2)
+		if err != nil {
+			t.Fatalf("pull: %v", err)
+		}
+		for _, u := range resp.Changes["categories"].Upserts {
+			seen[u.(categoryUpsertDTO).ID] = true
+		}
+		cursor = resp.NextCursor
+		hasMore = resp.HasMore
+	}
+	for id := range wantIDs {
+		if !seen[id] {
+			t.Fatalf("category id %s was never delivered as an upsert across any page", id)
+		}
+	}
+
+	// Soft-delete one category and prove it's delivered as a tombstone
+	// (never an upsert) on the next pull.
+	var deletedID string
+	for id := range wantIDs {
+		deletedID = id
+		break
+	}
+	if _, err := pool.Exec(ctx, `UPDATE categories SET deleted_at = now(), updated_at = now() WHERE id = $1`, mustParseUUID(t, deletedID)); err != nil {
+		t.Fatalf("soft-delete category: %v", err)
+	}
+
+	final, err := svc.pull(ctx, userIDString(user), cursor, 500)
+	if err != nil {
+		t.Fatalf("pull (after delete): %v", err)
+	}
+	foundTombstone := false
+	for _, ts := range final.Changes["categories"].Tombstones {
+		if ts.(categoryTombstoneDTO).ID == deletedID {
+			foundTombstone = true
+		}
+	}
+	if !foundTombstone {
+		t.Fatalf("deleted category was not delivered as a tombstone")
+	}
+	for _, u := range final.Changes["categories"].Upserts {
+		if u.(categoryUpsertDTO).ID == deletedID {
+			t.Fatalf("deleted category was delivered as an upsert, not a tombstone")
+		}
+	}
+}
+
+// TestPullXminHorizonExcludesRaceWithLowerServerSeq is the H1 regression
+// test: it reproduces the scenario the fix targets — a transaction with a
+// LOWER server_seq still uncommitted while a transaction with a HIGHER
+// server_seq has already committed — and proves a pull neither delivers
+// the higher-seq row in a way that would let next_cursor skip past the
+// lower-seq one, nor ever permanently loses the lower-seq row once it
+// commits.
+//
+// Ordering is deterministic via explicit BEGIN/COMMIT on two separate
+// pooled connections (no sleeps): txLow's INSERT runs and is left
+// uncommitted (so it is assigned a server_seq before txHigh's, via
+// server_seq_global's ordering, but has not yet committed); txHigh's
+// INSERT then runs to completion (auto-committed), guaranteeing txHigh's
+// row has a HIGHER server_seq than txLow's while txLow is still open.
+func TestPullXminHorizonExcludesRaceWithLowerServerSeq(t *testing.T) {
+	pool := testPool(t)
+	q := storedb.New(pool)
+	user, _ := newUser(t, q)
+	svc := &Service{Queries: q, Pool: pool}
+	ctx := context.Background()
+
+	txLow, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin txLow: %v", err)
+	}
+	lowID := newUUIDv7(t)
+	if _, err := txLow.Exec(ctx, `
+		INSERT INTO tags (id, user_id, name, updated_at) VALUES ($1, $2, $3, now())`,
+		mustParseUUID(t, lowID), user.ID, "concurrency-low-"+randomSuffix(t)); err != nil {
+		t.Fatalf("insert low (uncommitted): %v", err)
+	}
+
+	// Committed immediately, on a different pooled connection, strictly
+	// after txLow's INSERT has already been assigned its (lower)
+	// server_seq — so this row's server_seq is guaranteed higher while
+	// txLow is still uncommitted.
+	highID := newUUIDv7(t)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO tags (id, user_id, name, updated_at) VALUES ($1, $2, $3, now())`,
+		mustParseUUID(t, highID), user.ID, "concurrency-high-"+randomSuffix(t)); err != nil {
+		t.Fatalf("insert high (committed): %v", err)
+	}
+
+	// While txLow is still open: the pull must not deliver "high" at all
+	// (it's excluded by xid_before_snapshot_horizon since txLow, an
+	// earlier-starting transaction with a lower server_seq, is still
+	// in-flight), and obviously can't deliver "low" either (it isn't even
+	// committed yet, so ordinary MVCC visibility already hides it). Either
+	// way, next_cursor must not advance past a point that would cause
+	// "low" to be skipped once it commits.
+	duringRace, err := svc.pull(ctx, userIDString(user), "", 500)
+	if err != nil {
+		t.Fatalf("pull (during race): %v", err)
+	}
+	for _, u := range duringRace.Changes["tags"].Upserts {
+		if u.(tagUpsertDTO).ID == highID {
+			t.Fatalf("pull delivered the higher-server_seq row while a lower-server_seq transaction was still uncommitted")
+		}
+		if u.(tagUpsertDTO).ID == lowID {
+			t.Fatalf("pull delivered the uncommitted row (should be impossible via ordinary MVCC visibility alone)")
+		}
+	}
+
+	if err := txLow.Commit(ctx); err != nil {
+		t.Fatalf("commit txLow: %v", err)
+	}
+
+	// Re-pull from the cursor the racy pull returned: both rows must now
+	// be delivered — "low" is not permanently skipped, and "high" (whether
+	// or not it was already delivered above) is delivered at least once.
+	afterCommit, err := svc.pull(ctx, userIDString(user), duringRace.NextCursor, 500)
+	if err != nil {
+		t.Fatalf("pull (after commit): %v", err)
+	}
+	seen := map[string]bool{}
+	for _, u := range duringRace.Changes["tags"].Upserts {
+		seen[u.(tagUpsertDTO).ID] = true
+	}
+	for _, u := range afterCommit.Changes["tags"].Upserts {
+		seen[u.(tagUpsertDTO).ID] = true
+	}
+	if !seen[lowID] {
+		t.Fatalf("the lower-server_seq row was never delivered even after its transaction committed (permanently skipped)")
+	}
+	if !seen[highID] {
+		t.Fatalf("the higher-server_seq row was never delivered across either pull")
+	}
 }

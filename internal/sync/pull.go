@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/mirkru37/rize-backend/internal/store"
@@ -38,20 +39,16 @@ const (
 // custom-category edit propagates to other devices via the same
 // keyset-pagination mechanism as user_app_settings, projects, tags,
 // activity_events, and focus_sessions" — which asserts categories ARE
-// pulled the same way. sync-protocol.md's own §Entity Classes table
-// likewise never lists a bare "categories" entity among the mutable/LWW
-// class (only "category overrides (user_app_settings)" appears there).
+// pulled the same way.
 //
-// This is a direct contradiction between the two source-of-truth documents
-// (database-schema.md says categories sync via server_seq keyset
-// pagination like every other syncable table; sync-protocol.md's Entity
-// Classes table and Pull response example both omit it) that RIZ-34's
-// brief does not resolve. Per this task's instructions, that sub-point is
-// STOPPED ON rather than guessed at: "categories" is deliberately left out
-// of the pull response below. See the PR description for this ticket for
-// the explicit callout.
+// That contradiction has since been resolved (RIZ-34 follow-up): category
+// rows ARE syncable per database-schema.md, so "categories" is included
+// below; sync-protocol.md's Entity Classes table / Pull worked example are
+// being reconciled to list it explicitly in a parallel documentation pass.
+// See ListCategoryChangesForUser's doc comment for the delivered-rows
+// scoping (system defaults + the caller's own categories).
 //
-// "aggregates" (server-derived rollups) is also omitted: no aggregation
+// "aggregates" (server-derived rollups) is still omitted: no aggregation
 // service exists yet in this codebase (internal/reports is an empty
 // package stub) to source it from, and RIZ-34's brief scopes this ticket
 // to "sync pull + CRUD route groups," not implementing the reports/
@@ -63,6 +60,7 @@ var pullEntityTypes = []string{
 	"projects",
 	"tags",
 	"user_app_settings",
+	"categories",
 }
 
 // changeSet is the wire shape of one entity type's page within
@@ -160,6 +158,27 @@ type userAppSettingUpsertDTO struct {
 	ServerSeq  int64   `json:"server_seq"`
 }
 
+// categoryUpsertDTO / categoryTombstoneDTO mirror the field set
+// internal/categories's CRUD DTOs already expose for a category row
+// (documentation/api-reference.md §CRUD groups), plus server_seq. UserID is
+// omitted from the wire shape: sync-protocol.md's other per-user entities
+// (projects, tags, ...) don't echo user_id either since it's implicit in
+// "this is the authenticated caller's pull stream" — a system default
+// category (user_id IS NULL) has no owner to report anyway.
+type categoryUpsertDTO struct {
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	Color        string `json:"color"`
+	Productivity int16  `json:"productivity"`
+	UpdatedAt    string `json:"updated_at"`
+	ServerSeq    int64  `json:"server_seq"`
+}
+
+type categoryTombstoneDTO struct {
+	ID        string `json:"id"`
+	ServerSeq int64  `json:"server_seq"`
+}
+
 func formatTs(ts pgtype.Timestamptz) string {
 	if !ts.Valid {
 		return ""
@@ -213,6 +232,18 @@ type pageResult struct {
 // small amount of redundant redelivery across page boundaries for an
 // already-drained entity type, which is explicitly safe per that
 // guarantee — it never causes a skip.
+//
+// All six per-entity-type queries run inside a single REPEATABLE READ,
+// READ ONLY transaction (see runInPullSnapshot), so every one of them sees
+// the exact same MVCC snapshot — and therefore the exact same
+// pg_snapshot_xmin/xmax horizon each query's xid_before_snapshot_horizon
+// predicate (migration 000024) gates on. Without a shared snapshot, two
+// queries issued as separate READ COMMITTED statements could each observe
+// a different horizon, reopening the same "advance next_cursor past a
+// row that turns out to still be uncommitted" gap this fix closes. See
+// migration 000024's comment for the horizon predicate itself and the
+// invariant that lets next_cursor safely advance only over rows it
+// excludes.
 func (s *Service) pull(ctx context.Context, userID, rawCursor string, rawLimit int) (pullResponse, error) {
 	uid, err := parseUUID(userID)
 	if err != nil {
@@ -234,35 +265,48 @@ func (s *Service) pull(ctx context.Context, userID, rawCursor string, rawLimit i
 
 	results := make(map[string]pageResult, len(pullEntityTypes))
 
-	aeResult, err := s.pullActivityEvents(ctx, uid, cursor, limit)
-	if err != nil {
-		return pullResponse{}, fmt.Errorf("sync: pull activity_events: %w", err)
-	}
-	results["activity_events"] = aeResult
+	err = s.runInPullSnapshot(ctx, func(q storedb.Querier) error {
+		aeResult, err := pullActivityEvents(ctx, q, uid, cursor, limit)
+		if err != nil {
+			return fmt.Errorf("sync: pull activity_events: %w", err)
+		}
+		results["activity_events"] = aeResult
 
-	fsResult, err := s.pullFocusSessions(ctx, uid, cursor, limit)
-	if err != nil {
-		return pullResponse{}, fmt.Errorf("sync: pull focus_sessions: %w", err)
-	}
-	results["focus_sessions"] = fsResult
+		fsResult, err := pullFocusSessions(ctx, q, uid, cursor, limit)
+		if err != nil {
+			return fmt.Errorf("sync: pull focus_sessions: %w", err)
+		}
+		results["focus_sessions"] = fsResult
 
-	prResult, err := s.pullProjects(ctx, uid, cursor, limit)
-	if err != nil {
-		return pullResponse{}, fmt.Errorf("sync: pull projects: %w", err)
-	}
-	results["projects"] = prResult
+		prResult, err := pullProjects(ctx, q, uid, cursor, limit)
+		if err != nil {
+			return fmt.Errorf("sync: pull projects: %w", err)
+		}
+		results["projects"] = prResult
 
-	tgResult, err := s.pullTags(ctx, uid, cursor, limit)
-	if err != nil {
-		return pullResponse{}, fmt.Errorf("sync: pull tags: %w", err)
-	}
-	results["tags"] = tgResult
+		tgResult, err := pullTags(ctx, q, uid, cursor, limit)
+		if err != nil {
+			return fmt.Errorf("sync: pull tags: %w", err)
+		}
+		results["tags"] = tgResult
 
-	uasResult, err := s.pullUserAppSettings(ctx, uid, cursor, limit)
+		uasResult, err := pullUserAppSettings(ctx, q, uid, cursor, limit)
+		if err != nil {
+			return fmt.Errorf("sync: pull user_app_settings: %w", err)
+		}
+		results["user_app_settings"] = uasResult
+
+		catResult, err := pullCategories(ctx, q, uid, cursor, limit)
+		if err != nil {
+			return fmt.Errorf("sync: pull categories: %w", err)
+		}
+		results["categories"] = catResult
+
+		return nil
+	})
 	if err != nil {
-		return pullResponse{}, fmt.Errorf("sync: pull user_app_settings: %w", err)
+		return pullResponse{}, err
 	}
-	results["user_app_settings"] = uasResult
 
 	hasMore := false
 	minPendingSeq := int64(-1)
@@ -310,8 +354,54 @@ func nonNilSlice(items []any) []any {
 	return items
 }
 
-func (s *Service) pullActivityEvents(ctx context.Context, uid pgtype.UUID, cursor int64, limit int) (pageResult, error) {
-	rows, err := s.Queries.ListActivityEventChangesForUser(ctx, storedb.ListActivityEventChangesForUserParams{
+// Beginner starts a transaction with explicit options. *pgxpool.Pool
+// satisfies this interface (its BeginTx method). It is narrowed to just
+// BeginTx (rather than depending on the full pool) per this codebase's
+// existing internal/auth.Beginner convention.
+type Beginner interface {
+	BeginTx(ctx context.Context, txOptions pgx.TxOptions) (pgx.Tx, error)
+}
+
+// pullSnapshotTxOptions is the isolation level every pull's per-entity-type
+// queries share: REPEATABLE READ so all of them observe one fixed MVCC
+// snapshot (and therefore one fixed xid_before_snapshot_horizon horizon,
+// see migration 000024) instead of each being its own READ COMMITTED
+// statement with a potentially different snapshot. ReadOnly since a pull
+// never writes.
+var pullSnapshotTxOptions = pgx.TxOptions{
+	IsoLevel:   pgx.RepeatableRead,
+	AccessMode: pgx.ReadOnly,
+}
+
+// runInPullSnapshot runs fn with a storedb.Querier scoped to a single
+// REPEATABLE READ, READ ONLY transaction when s.Pool is configured (always
+// true in production; see cmd/api/main.go's wiring), so every per-entity-
+// type query fn issues sees the same MVCC snapshot per this file's H1 fix.
+//
+// When s.Pool is nil (only expected for a Service wired without a real
+// *pgxpool.Pool, e.g. a hand-built unit-test fixture that doesn't exercise
+// this fix), fn instead runs directly against s.Queries with no shared
+// transaction — the same non-transactional fallback internal/auth.Service
+// already uses for its Pool-optional operations.
+func (s *Service) runInPullSnapshot(ctx context.Context, fn func(q storedb.Querier) error) error {
+	if s.Pool == nil {
+		return fn(s.Queries)
+	}
+
+	tx, err := s.Pool.BeginTx(ctx, pullSnapshotTxOptions)
+	if err != nil {
+		return fmt.Errorf("sync: begin pull snapshot transaction: %w", err)
+	}
+	// A pull never writes, so there's nothing to commit; rolling back is
+	// enough to release the snapshot/transaction either way (including on
+	// the success path, once fn has already read everything it needs).
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	return fn(storedb.New(tx))
+}
+
+func pullActivityEvents(ctx context.Context, q storedb.Querier, uid pgtype.UUID, cursor int64, limit int) (pageResult, error) {
+	rows, err := q.ListActivityEventChangesForUser(ctx, storedb.ListActivityEventChangesForUserParams{
 		UserID:    uid,
 		ServerSeq: cursor,
 		Limit:     store.LimitParam(limit + 1),
@@ -346,8 +436,8 @@ func (s *Service) pullActivityEvents(ctx context.Context, uid pgtype.UUID, curso
 	return result, nil
 }
 
-func (s *Service) pullFocusSessions(ctx context.Context, uid pgtype.UUID, cursor int64, limit int) (pageResult, error) {
-	rows, err := s.Queries.ListFocusSessionChangesForUser(ctx, storedb.ListFocusSessionChangesForUserParams{
+func pullFocusSessions(ctx context.Context, q storedb.Querier, uid pgtype.UUID, cursor int64, limit int) (pageResult, error) {
+	rows, err := q.ListFocusSessionChangesForUser(ctx, storedb.ListFocusSessionChangesForUserParams{
 		UserID:    uid,
 		ServerSeq: cursor,
 		Limit:     store.LimitParam(limit + 1),
@@ -385,8 +475,8 @@ func (s *Service) pullFocusSessions(ctx context.Context, uid pgtype.UUID, cursor
 	return result, nil
 }
 
-func (s *Service) pullProjects(ctx context.Context, uid pgtype.UUID, cursor int64, limit int) (pageResult, error) {
-	rows, err := s.Queries.ListProjectChangesForUser(ctx, storedb.ListProjectChangesForUserParams{
+func pullProjects(ctx context.Context, q storedb.Querier, uid pgtype.UUID, cursor int64, limit int) (pageResult, error) {
+	rows, err := q.ListProjectChangesForUser(ctx, storedb.ListProjectChangesForUserParams{
 		UserID:    uid,
 		ServerSeq: cursor,
 		Limit:     store.LimitParam(limit + 1),
@@ -420,8 +510,8 @@ func (s *Service) pullProjects(ctx context.Context, uid pgtype.UUID, cursor int6
 	return result, nil
 }
 
-func (s *Service) pullTags(ctx context.Context, uid pgtype.UUID, cursor int64, limit int) (pageResult, error) {
-	rows, err := s.Queries.ListTagChangesForUser(ctx, storedb.ListTagChangesForUserParams{
+func pullTags(ctx context.Context, q storedb.Querier, uid pgtype.UUID, cursor int64, limit int) (pageResult, error) {
+	rows, err := q.ListTagChangesForUser(ctx, storedb.ListTagChangesForUserParams{
 		UserID:    uid,
 		ServerSeq: cursor,
 		Limit:     store.LimitParam(limit + 1),
@@ -453,8 +543,8 @@ func (s *Service) pullTags(ctx context.Context, uid pgtype.UUID, cursor int64, l
 	return result, nil
 }
 
-func (s *Service) pullUserAppSettings(ctx context.Context, uid pgtype.UUID, cursor int64, limit int) (pageResult, error) {
-	rows, err := s.Queries.ListUserAppSettingChangesForUser(ctx, storedb.ListUserAppSettingChangesForUserParams{
+func pullUserAppSettings(ctx context.Context, q storedb.Querier, uid pgtype.UUID, cursor int64, limit int) (pageResult, error) {
+	rows, err := q.ListUserAppSettingChangesForUser(ctx, storedb.ListUserAppSettingChangesForUserParams{
 		UserID:    uid,
 		ServerSeq: cursor,
 		Limit:     store.LimitParam(limit + 1),
@@ -478,6 +568,44 @@ func (s *Service) pullUserAppSettings(ctx context.Context, uid pgtype.UUID, curs
 			Excluded:   row.Excluded,
 			UpdatedAt:  formatTs(row.UpdatedAt),
 			ServerSeq:  row.ServerSeq,
+		})
+	}
+	return result, nil
+}
+
+// pullCategories delivers ListCategoryChangesForUser's page (see that
+// query's doc comment for the delivered-rows scoping — system defaults
+// plus the caller's own categories).
+func pullCategories(ctx context.Context, q storedb.Querier, uid pgtype.UUID, cursor int64, limit int) (pageResult, error) {
+	rows, err := q.ListCategoryChangesForUser(ctx, storedb.ListCategoryChangesForUserParams{
+		UserID:    uid,
+		ServerSeq: cursor,
+		Limit:     store.LimitParam(limit + 1),
+	})
+	if err != nil {
+		return pageResult{}, err
+	}
+	hasMore := len(rows) > limit
+	if hasMore {
+		rows = rows[:limit]
+	}
+	result := pageResult{hasMore: hasMore, lastSeq: cursor}
+	for _, row := range rows {
+		result.lastSeq = row.ServerSeq
+		if row.DeletedAt.Valid {
+			result.tombstones = append(result.tombstones, categoryTombstoneDTO{
+				ID:        row.ID.String(),
+				ServerSeq: row.ServerSeq,
+			})
+			continue
+		}
+		result.upserts = append(result.upserts, categoryUpsertDTO{
+			ID:           row.ID.String(),
+			Name:         row.Name,
+			Color:        row.Color,
+			Productivity: row.Productivity,
+			UpdatedAt:    formatTs(row.UpdatedAt),
+			ServerSeq:    row.ServerSeq,
 		})
 	}
 	return result, nil

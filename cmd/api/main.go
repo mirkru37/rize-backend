@@ -147,7 +147,11 @@ func newRouter(logger *slog.Logger, cfg config.Config, pool *pgxpool.Pool) http.
 	authService := &auth.Service{Queries: queries, Pool: beginner, SigningKey: signingKey}
 	authHandler := auth.NewHandler(authService)
 
-	syncService := &sync.Service{Queries: queries}
+	var syncBeginner sync.Beginner
+	if pool != nil {
+		syncBeginner = pool
+	}
+	syncService := &sync.Service{Queries: queries, Pool: syncBeginner}
 	syncHandler := sync.NewHandler(syncService)
 
 	projectsService := &projects.Service{Queries: queries}

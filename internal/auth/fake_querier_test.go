@@ -249,6 +249,10 @@ func (f *fakeQuerier) ListCategoriesForUser(context.Context, storedb.ListCategor
 	return nil, errNotImplementedByFakeQuerier
 }
 
+func (f *fakeQuerier) ListCategoryChangesForUser(context.Context, storedb.ListCategoryChangesForUserParams) ([]storedb.ListCategoryChangesForUserRow, error) {
+	return nil, errNotImplementedByFakeQuerier
+}
+
 func (f *fakeQuerier) ListFocusSessionChangesForUser(context.Context, storedb.ListFocusSessionChangesForUserParams) ([]storedb.ListFocusSessionChangesForUserRow, error) {
 	return nil, errNotImplementedByFakeQuerier
 }
