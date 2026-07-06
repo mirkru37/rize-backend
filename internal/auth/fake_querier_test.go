@@ -181,6 +181,10 @@ func (f *fakeQuerier) GetFocusSessionByID(context.Context, pgtype.UUID) (storedb
 	return storedb.FocusSession{}, errNotImplementedByFakeQuerier
 }
 
+func (f *fakeQuerier) GetProjectByIDForUser(context.Context, storedb.GetProjectByIDForUserParams) (storedb.Project, error) {
+	return storedb.Project{}, errNotImplementedByFakeQuerier
+}
+
 func (f *fakeQuerier) GetUserAppSettingByUserAndApp(context.Context, storedb.GetUserAppSettingByUserAndAppParams) (storedb.UserAppSetting, error) {
 	return storedb.UserAppSetting{}, errNotImplementedByFakeQuerier
 }

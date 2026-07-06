@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/mirkru37/rize-backend/internal/store/storedb"
@@ -220,6 +221,13 @@ func (s *Service) applyActivityEvent(ctx context.Context, userID, deviceID pgtyp
 	})
 	if err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
+			// Defense-in-depth per documentation/sync-protocol.md §Push: a
+			// constraint violation on this INSERT (e.g. an unresolvable
+			// category_id) is a per-item "invalid", never a batch-aborting
+			// 500.
+			if code, message, ok := constraintViolationResult(err); ok {
+				return invalidActivityEvent(index, data.EventID, code, message), nil
+			}
 			return pushResult{}, fmt.Errorf("insert activity event: %w", err)
 		}
 
@@ -286,6 +294,21 @@ func (s *Service) applyFocusSession(ctx context.Context, userID, deviceID pgtype
 	if err != nil {
 		return invalidFocusSession(index, data.ID, "VALIDATION_ERROR", "project_id must be a valid UUID"), nil
 	}
+	if projectID.Valid {
+		// Tenant-scope project_id per documentation/security.md §Tenant
+		// Isolation: existence alone (which the projects_id_fkey FK below
+		// would otherwise be the only check for) isn't enough — the project
+		// must also belong to the authenticated caller. A project_id that's
+		// either unknown or owned by a different user is reported
+		// identically ("invalid"/FOREIGN_KEY_VIOLATION) so the response
+		// never reveals whether another tenant's project exists.
+		if _, getErr := s.Queries.GetProjectByIDForUser(ctx, storedb.GetProjectByIDForUserParams{ID: projectID, UserID: userID}); getErr != nil {
+			if errors.Is(getErr, pgx.ErrNoRows) {
+				return invalidFocusSession(index, data.ID, "FOREIGN_KEY_VIOLATION", "project_id does not reference an existing project owned by this user"), nil
+			}
+			return pushResult{}, fmt.Errorf("resolve project: %w", getErr)
+		}
+	}
 	if !validFocusKind[data.Kind] {
 		return invalidFocusSession(index, data.ID, "VALIDATION_ERROR", "kind must be one of focus, break, meeting"), nil
 	}
@@ -326,6 +349,15 @@ func (s *Service) applyFocusSession(ctx context.Context, userID, deviceID pgtype
 	})
 	if err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
+			// Defense-in-depth: the GetProjectByIDForUser check above
+			// should already keep an out-of-tenant/nonexistent project_id
+			// from reaching this INSERT, but a constraint violation
+			// (e.g. TOCTOU with a concurrently-deleted project) is still a
+			// per-item "invalid", never a batch-aborting 500, per
+			// documentation/sync-protocol.md §Push.
+			if code, message, ok := constraintViolationResult(err); ok {
+				return invalidFocusSession(index, data.ID, code, message), nil
+			}
 			return pushResult{}, fmt.Errorf("upsert focus session: %w", err)
 		}
 
@@ -343,6 +375,35 @@ func (s *Service) applyFocusSession(ctx context.Context, userID, deviceID pgtype
 	}
 
 	return appliedFocusSession(index, data.ID, upserted.ServerSeq), nil
+}
+
+// constraintViolationResult inspects err for a Postgres constraint-violation
+// SQLSTATE and, if found, returns the (code, message) pair for a per-item
+// "invalid" pushResult per documentation/sync-protocol.md §Push ("a batch is
+// never rejected as a whole because one item is invalid"). ok is false for
+// any other error (including no error at all), signaling the caller should
+// treat it as an unexpected, batch-aborting failure instead.
+//
+// Messages are static or built only from pgErr.ConstraintName — never from
+// pgErr.Message or the offending payload values, which can echo submitted
+// data back to the client.
+func constraintViolationResult(err error) (code, message string, ok bool) {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return "", "", false
+	}
+	switch pgErr.Code {
+	case "23503": // foreign_key_violation
+		return "FOREIGN_KEY_VIOLATION", "referenced row does not exist", true
+	case "23514", "23505", "23502": // check/unique/not_null violation
+		message := "value violates a database constraint"
+		if pgErr.ConstraintName != "" {
+			message = fmt.Sprintf("value violates constraint %q", pgErr.ConstraintName)
+		}
+		return "VALIDATION_ERROR", message, true
+	default:
+		return "", "", false
+	}
 }
 
 // resolveApp implements documentation/architecture-backend.md §Ingestion

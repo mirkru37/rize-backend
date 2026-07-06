@@ -106,6 +106,41 @@ func (q *Queries) GetFocusSessionByID(ctx context.Context, id pgtype.UUID) (Focu
 	return i, err
 }
 
+const getProjectByIDForUser = `-- name: GetProjectByIDForUser :one
+SELECT id, user_id, name, color, created_at, updated_at, archived_at, deleted_at, server_seq FROM projects
+WHERE id = $1 AND user_id = $2
+`
+
+type GetProjectByIDForUserParams struct {
+	ID     pgtype.UUID `json:"id"`
+	UserID pgtype.UUID `json:"user_id"`
+}
+
+// Tenant-scoped existence check for a client-supplied focus_session
+// project_id, per documentation/security.md §Tenant Isolation: a project_id
+// is only accepted if it both exists and belongs to the authenticated
+// user_id, so user A can never reference user B's project (an FK violation
+// alone only proves the row exists somewhere, not that it's the caller's).
+// Zero rows for either reason (missing entirely, or owned by someone else)
+// so the caller cannot distinguish "doesn't exist" from "not yours" and
+// leak the other tenant's project existence.
+func (q *Queries) GetProjectByIDForUser(ctx context.Context, arg GetProjectByIDForUserParams) (Project, error) {
+	row := q.db.QueryRow(ctx, getProjectByIDForUser, arg.ID, arg.UserID)
+	var i Project
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.Name,
+		&i.Color,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.ArchivedAt,
+		&i.DeletedAt,
+		&i.ServerSeq,
+	)
+	return i, err
+}
+
 const getUserAppSettingByUserAndApp = `-- name: GetUserAppSettingByUserAndApp :one
 SELECT user_id, app_id, category_id, excluded, updated_at, server_seq FROM user_app_settings
 WHERE user_id = $1 AND app_id = $2

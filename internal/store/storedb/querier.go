@@ -47,6 +47,15 @@ type Querier interface {
 	// violation, reported as "invalid") from a same-user last-write-wins loss
 	// (reported as "duplicate") — see internal/sync's push service.
 	GetFocusSessionByID(ctx context.Context, id pgtype.UUID) (FocusSession, error)
+	// Tenant-scoped existence check for a client-supplied focus_session
+	// project_id, per documentation/security.md §Tenant Isolation: a project_id
+	// is only accepted if it both exists and belongs to the authenticated
+	// user_id, so user A can never reference user B's project (an FK violation
+	// alone only proves the row exists somewhere, not that it's the caller's).
+	// Zero rows for either reason (missing entirely, or owned by someone else)
+	// so the caller cannot distinguish "doesn't exist" from "not yours" and
+	// leak the other tenant's project existence.
+	GetProjectByIDForUser(ctx context.Context, arg GetProjectByIDForUserParams) (Project, error)
 	GetRefreshTokenByHash(ctx context.Context, tokenHash []byte) (RefreshToken, error)
 	// Blocking row lock, used only after GetRefreshTokenByHashForUpdateNoWait
 	// has detected contention: waits for the concurrently in-flight rotation to

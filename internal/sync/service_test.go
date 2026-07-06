@@ -114,10 +114,18 @@ func activityEventItemFull(t *testing.T, eventID, bundleID string, startedAt, en
 
 func focusSessionItem(t *testing.T, id string, updatedAt, startedAt time.Time) pushItem {
 	t.Helper()
+	return focusSessionItemWithProject(t, id, updatedAt, startedAt, "")
+}
+
+// focusSessionItemWithProject builds a focus_session pushItem with an
+// explicit project_id (empty string omits it from the wire payload).
+func focusSessionItemWithProject(t *testing.T, id string, updatedAt, startedAt time.Time, projectID string) pushItem {
+	t.Helper()
 	data, err := json.Marshal(focusSessionData{
 		ID:        id,
 		UpdatedAt: updatedAt.Format(timeLayout),
 		StartedAt: startedAt.Format(timeLayout),
+		ProjectID: projectID,
 		Kind:      "focus",
 		Status:    "running",
 		Note:      textPtr("test session"),
@@ -126,6 +134,25 @@ func focusSessionItem(t *testing.T, id string, updatedAt, startedAt time.Time) p
 		t.Fatalf("marshal focusSessionData: %v", err)
 	}
 	return pushItem{EntityType: "focus_session", Data: data}
+}
+
+// newProject inserts a project row owned by user directly via SQL (there is
+// no sync-package write path for creating projects), for use as a
+// focus_session.project_id fixture in tests. Returns the project's id as a
+// string, ready to feed into focusSessionItemWithProject.
+func newProject(t *testing.T, pool *pgxpool.Pool, user storedb.User) string {
+	t.Helper()
+	ctx := context.Background()
+	idStr := newUUIDv7(t)
+	now := time.Now().UTC()
+	_, err := pool.Exec(ctx, `
+		INSERT INTO projects (id, user_id, name, color, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $5)`,
+		mustParseUUID(t, idStr), user.ID, "Test Project "+randomSuffix(t), "#ffffff", now)
+	if err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	return idStr
 }
 
 func userIDString(user storedb.User) string { return user.ID.String() }
@@ -521,5 +548,137 @@ func TestPushActivityEventTombstone(t *testing.T) {
 	}
 	if again.Results[0].Status != "duplicate" {
 		t.Fatalf("re-tombstone status = %q, want duplicate", again.Results[0].Status)
+	}
+}
+
+// TestPushFocusSessionBogusProjectIDInvalidNotBatchAborting proves that a
+// focus_session with a project_id that doesn't reference any existing
+// project is reported as a per-item "invalid" (FOREIGN_KEY_VIOLATION)
+// instead of aborting the whole push as an internal error, per RIZ-33
+// code-review fix (H1): a batch is never rejected as a whole because one
+// item is invalid. A sibling valid item in the same batch must still be
+// committed.
+func TestPushFocusSessionBogusProjectIDInvalidNotBatchAborting(t *testing.T) {
+	pool := testPool(t)
+	q := storedb.New(pool)
+	user, device := newUser(t, q)
+	svc := &Service{Queries: q}
+	ctx := context.Background()
+
+	base := time.Now().UTC().Truncate(time.Second)
+	validID := newUUIDv7(t)
+	bogusID := newUUIDv7(t)
+
+	resp, err := svc.push(ctx, userIDString(user), pushRequest{
+		DeviceID: device.ID.String(),
+		Items: []pushItem{
+			focusSessionItem(t, validID, base, base),
+			focusSessionItemWithProject(t, bogusID, base, base, newUUIDv7(t)),
+		},
+	})
+	if err != nil {
+		t.Fatalf("push: %v, want no error (an invalid item must not abort the batch)", err)
+	}
+	if len(resp.Results) != 2 {
+		t.Fatalf("len(results) = %d, want 2", len(resp.Results))
+	}
+	if resp.Results[0].Status != "applied" {
+		t.Errorf("results[0].Status = %q, want applied", resp.Results[0].Status)
+	}
+	if resp.Results[1].Status != "invalid" {
+		t.Fatalf("results[1].Status = %q, want invalid", resp.Results[1].Status)
+	}
+	if resp.Results[1].Error == nil || resp.Results[1].Error.Code != "FOREIGN_KEY_VIOLATION" {
+		t.Errorf("results[1].Error = %+v, want FOREIGN_KEY_VIOLATION", resp.Results[1].Error)
+	}
+
+	var count int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM focus_sessions WHERE id = $1`, mustParseUUID(t, validID)).Scan(&count); err != nil {
+		t.Fatalf("count focus_sessions (valid): %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("valid item's focus_sessions row count = %d, want 1", count)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM focus_sessions WHERE id = $1`, mustParseUUID(t, bogusID)).Scan(&count); err != nil {
+		t.Fatalf("count focus_sessions (bogus): %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("bogus item's focus_sessions row count = %d, want 0 (must not be created)", count)
+	}
+}
+
+// TestPushFocusSessionOtherUsersProjectRejected proves that a project_id
+// which exists but belongs to a different user is rejected identically to a
+// nonexistent one ("invalid"/FOREIGN_KEY_VIOLATION), per RIZ-33 code-review
+// fix (M1): project_id must be tenant-scoped, not merely existence-checked
+// by the foreign key, so user A cannot reference user B's project.
+func TestPushFocusSessionOtherUsersProjectRejected(t *testing.T) {
+	pool := testPool(t)
+	q := storedb.New(pool)
+	userA, deviceA := newUser(t, q)
+	userB, _ := newUser(t, q)
+	svc := &Service{Queries: q}
+	ctx := context.Background()
+
+	othersProjectID := newProject(t, pool, userB)
+
+	base := time.Now().UTC().Truncate(time.Second)
+	sessionID := newUUIDv7(t)
+
+	resp, err := svc.push(ctx, userIDString(userA), pushRequest{
+		DeviceID: deviceA.ID.String(),
+		Items:    []pushItem{focusSessionItemWithProject(t, sessionID, base, base, othersProjectID)},
+	})
+	if err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	if len(resp.Results) != 1 || resp.Results[0].Status != "invalid" {
+		t.Fatalf("results = %+v, want a single invalid result", resp.Results)
+	}
+	if resp.Results[0].Error == nil || resp.Results[0].Error.Code != "FOREIGN_KEY_VIOLATION" {
+		t.Errorf("results[0].Error = %+v, want FOREIGN_KEY_VIOLATION", resp.Results[0].Error)
+	}
+
+	var count int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM focus_sessions WHERE id = $1`, mustParseUUID(t, sessionID)).Scan(&count); err != nil {
+		t.Fatalf("count focus_sessions: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("focus_sessions row count = %d, want 0 (must not be created against another user's project)", count)
+	}
+}
+
+// TestPushFocusSessionOwnProjectApplied proves that a focus_session
+// referencing the caller's own, existing project is applied and the
+// project_id is persisted on the row.
+func TestPushFocusSessionOwnProjectApplied(t *testing.T) {
+	pool := testPool(t)
+	q := storedb.New(pool)
+	user, device := newUser(t, q)
+	svc := &Service{Queries: q}
+	ctx := context.Background()
+
+	projectID := newProject(t, pool, user)
+
+	base := time.Now().UTC().Truncate(time.Second)
+	sessionID := newUUIDv7(t)
+
+	resp, err := svc.push(ctx, userIDString(user), pushRequest{
+		DeviceID: device.ID.String(),
+		Items:    []pushItem{focusSessionItemWithProject(t, sessionID, base, base, projectID)},
+	})
+	if err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	if len(resp.Results) != 1 || resp.Results[0].Status != "applied" {
+		t.Fatalf("results = %+v, want a single applied result", resp.Results)
+	}
+
+	var storedProjectID pgtype.UUID
+	if err := pool.QueryRow(ctx, `SELECT project_id FROM focus_sessions WHERE id = $1`, mustParseUUID(t, sessionID)).Scan(&storedProjectID); err != nil {
+		t.Fatalf("select focus_sessions: %v", err)
+	}
+	if storedProjectID != mustParseUUID(t, projectID) {
+		t.Errorf("stored project_id = %+v, want %+v", storedProjectID, mustParseUUID(t, projectID))
 	}
 }

@@ -70,6 +70,18 @@ SET deleted = true
 WHERE user_id = $1 AND event_id = $2 AND started_at = $3 AND deleted = false
 RETURNING *;
 
+-- name: GetProjectByIDForUser :one
+-- Tenant-scoped existence check for a client-supplied focus_session
+-- project_id, per documentation/security.md §Tenant Isolation: a project_id
+-- is only accepted if it both exists and belongs to the authenticated
+-- user_id, so user A can never reference user B's project (an FK violation
+-- alone only proves the row exists somewhere, not that it's the caller's).
+-- Zero rows for either reason (missing entirely, or owned by someone else)
+-- so the caller cannot distinguish "doesn't exist" from "not yours" and
+-- leak the other tenant's project existence.
+SELECT * FROM projects
+WHERE id = $1 AND user_id = $2;
+
 -- name: GetFocusSessionByID :one
 -- Unscoped-by-user lookup used only to distinguish, after an
 -- UpsertFocusSession call returns zero rows, whether the existing row
