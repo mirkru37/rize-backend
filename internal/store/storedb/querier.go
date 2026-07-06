@@ -11,6 +11,19 @@ import (
 )
 
 type Querier interface {
+	// Closed-period fast path for reports/apps: sums the daily_app_totals
+	// continuous aggregate over [from_day, to_day) per
+	// documentation/architecture-backend.md §Aggregation Strategy. Only used
+	// when the request has no device_id/precision filter — see
+	// internal/reports/service.go.
+	AppTotalsForRange(ctx context.Context, arg AppTotalsForRangeParams) ([]AppTotalsForRangeRow, error)
+	// Closed-period fast path for reports/daily, reports/categories, and
+	// reports/summary's category breakdown: sums the daily_category_totals
+	// continuous aggregate over [from_day, to_day) per
+	// documentation/architecture-backend.md §Aggregation Strategy. Only used
+	// when the request has no device_id/precision filter (the aggregate has
+	// neither dimension) — see internal/reports/service.go.
+	CategoryTotalsForRange(ctx context.Context, arg CategoryTotalsForRangeParams) ([]CategoryTotalsForRangeRow, error)
 	// Auto-creates an apps row the first time a bundle_id/platform pair is
 	// observed during ingestion, per documentation/architecture-backend.md
 	// §Ingestion Pipeline ("if no matching row exists, one is created
@@ -185,6 +198,26 @@ type Querier interface {
 	// request body) per documentation/security.md §Tenant Isolation.
 	InsertActivityEvent(ctx context.Context, arg InsertActivityEventParams) (ActivityEvent, error)
 	ListActiveRefreshTokensByUser(ctx context.Context, userID pgtype.UUID) ([]RefreshToken, error)
+	// GET /v1/activities per documentation/api-reference.md §Activities &
+	// reports: raw tracked events for the authenticated user, filterable by
+	// time range, app, category, project, device, and precision. Scoped by
+	// user_id per documentation/security.md §Tenant Isolation. Soft-deleted
+	// (deleted = true) rows are excluded, matching the CRUD groups' convention
+	// of excluding tombstoned rows from a "current state" list.
+	//
+	// Keyset-paginated on (started_at, event_id) ascending rather than the
+	// server_seq cursor other CRUD lists use: an activity-events list is
+	// naturally consumed in chronological order over an explicit time range,
+	// and started_at is the hypertable's own partitioning column, so ordering
+	// on it lets Postgres use the activity_events_user_started_idx index
+	// instead of the server_seq index. The initial page passes
+	// cursor_started_at = '-infinity' and cursor_event_id =
+	// '00000000-0000-0000-0000-000000000000' (see internal/activities'
+	// cursor.go), which sorts before every real row.
+	//
+	// sqlc.narg filters: a NULL argument (an omitted query-string filter)
+	// disables that filter's predicate entirely via the "IS NULL OR" branch.
+	ListActivityEventsForUser(ctx context.Context, arg ListActivityEventsForUserParams) ([]ActivityEvent, error)
 	// GET /v1/categories per documentation/api-reference.md §CRUD groups.
 	// documentation/database-schema.md's categories table: "user_id IS NULL
 	// denotes a system default category available to every user; user_id set
@@ -244,6 +277,20 @@ type Querier interface {
 	// documentation/api-reference.md §Conventions. Scoped by user_id per
 	// documentation/security.md §Tenant Isolation; excludes soft-deleted rows.
 	ListTagsForUser(ctx context.Context, arg ListTagsForUserParams) ([]Tag, error)
+	// The report layer's raw-event pass, per documentation/architecture-backend.md
+	// §Aggregation Strategy: used (a) always for the current/partial period,
+	// and (b) as the only path for filters (device_id, precision) or
+	// dimensions (project) the continuous aggregates cannot serve, since
+	// daily_app_totals/daily_category_totals carry no device_id or precision
+	// column and no project-dimensioned aggregate exists at all — see
+	// internal/reports' service.go doc comment for the full resolution.
+	//
+	// Selects events overlapping [from_ts, to_ts) — not merely started within
+	// it — so an event that begins before the window and ends inside it (or
+	// vice versa) is still included for trimming, which clips each event to
+	// the window before merging. Joins apps/categories/projects so the report
+	// layer never needs a second round trip to resolve display names.
+	RawActivityEventsForReport(ctx context.Context, arg RawActivityEventsForReportParams) ([]RawActivityEventsForReportRow, error)
 	// Scoped by user_id per documentation/security.md §Tenant Isolation.
 	RevokeDevice(ctx context.Context, arg RevokeDeviceParams) error
 	RevokeRefreshTokenFamily(ctx context.Context, familyID pgtype.UUID) error
