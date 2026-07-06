@@ -28,6 +28,16 @@ type Querier interface {
 	// authenticated as one user can never read another user's device row.
 	GetDeviceByID(ctx context.Context, arg GetDeviceByIDParams) (Device, error)
 	GetRefreshTokenByHash(ctx context.Context, tokenHash []byte) (RefreshToken, error)
+	// Blocking row lock, used only after GetRefreshTokenByHashForUpdateNoWait
+	// has detected contention: waits for the concurrently in-flight rotation to
+	// commit, then returns the now-serialized, final row state (RIZ-32 M2).
+	GetRefreshTokenByHashForUpdate(ctx context.Context, tokenHash []byte) (RefreshToken, error)
+	// Locks the refresh token row without blocking (SQLSTATE 55P03
+	// lock_not_available if another transaction already holds the lock), so the
+	// caller can distinguish "I am racing a concurrently in-flight rotation of
+	// this exact token" from "I am the only one looking at this row right now",
+	// per documentation/security.md's refresh-rotation flow (RIZ-32 M2).
+	GetRefreshTokenByHashForUpdateNoWait(ctx context.Context, tokenHash []byte) (RefreshToken, error)
 	GetUserByAppleUserID(ctx context.Context, appleUserID *string) (User, error)
 	GetUserByEmail(ctx context.Context, email *string) (User, error)
 	GetUserByID(ctx context.Context, id pgtype.UUID) (User, error)

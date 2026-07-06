@@ -73,6 +73,60 @@ func (q *Queries) GetRefreshTokenByHash(ctx context.Context, tokenHash []byte) (
 	return i, err
 }
 
+const getRefreshTokenByHashForUpdate = `-- name: GetRefreshTokenByHashForUpdate :one
+SELECT id, user_id, device_id, token_hash, family_id, issued_at, expires_at, revoked_at, replaced_by FROM refresh_tokens
+WHERE token_hash = $1
+FOR UPDATE
+`
+
+// Blocking row lock, used only after GetRefreshTokenByHashForUpdateNoWait
+// has detected contention: waits for the concurrently in-flight rotation to
+// commit, then returns the now-serialized, final row state (RIZ-32 M2).
+func (q *Queries) GetRefreshTokenByHashForUpdate(ctx context.Context, tokenHash []byte) (RefreshToken, error) {
+	row := q.db.QueryRow(ctx, getRefreshTokenByHashForUpdate, tokenHash)
+	var i RefreshToken
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.DeviceID,
+		&i.TokenHash,
+		&i.FamilyID,
+		&i.IssuedAt,
+		&i.ExpiresAt,
+		&i.RevokedAt,
+		&i.ReplacedBy,
+	)
+	return i, err
+}
+
+const getRefreshTokenByHashForUpdateNoWait = `-- name: GetRefreshTokenByHashForUpdateNoWait :one
+SELECT id, user_id, device_id, token_hash, family_id, issued_at, expires_at, revoked_at, replaced_by FROM refresh_tokens
+WHERE token_hash = $1
+FOR UPDATE NOWAIT
+`
+
+// Locks the refresh token row without blocking (SQLSTATE 55P03
+// lock_not_available if another transaction already holds the lock), so the
+// caller can distinguish "I am racing a concurrently in-flight rotation of
+// this exact token" from "I am the only one looking at this row right now",
+// per documentation/security.md's refresh-rotation flow (RIZ-32 M2).
+func (q *Queries) GetRefreshTokenByHashForUpdateNoWait(ctx context.Context, tokenHash []byte) (RefreshToken, error) {
+	row := q.db.QueryRow(ctx, getRefreshTokenByHashForUpdateNoWait, tokenHash)
+	var i RefreshToken
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.DeviceID,
+		&i.TokenHash,
+		&i.FamilyID,
+		&i.IssuedAt,
+		&i.ExpiresAt,
+		&i.RevokedAt,
+		&i.ReplacedBy,
+	)
+	return i, err
+}
+
 const listActiveRefreshTokensByUser = `-- name: ListActiveRefreshTokensByUser :many
 SELECT id, user_id, device_id, token_hash, family_id, issued_at, expires_at, revoked_at, replaced_by FROM refresh_tokens
 WHERE user_id = $1 AND revoked_at IS NULL AND expires_at > now()

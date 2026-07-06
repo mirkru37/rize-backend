@@ -12,6 +12,7 @@
 package auth
 
 import (
+	"context"
 	"crypto/rsa"
 	"errors"
 	"fmt"
@@ -29,6 +30,12 @@ import (
 // uniqueViolation is the Postgres SQLSTATE for a UNIQUE constraint
 // violation, used to detect a duplicate email on registration.
 const uniqueViolationSQLState = "23505"
+
+// lockNotAvailableSQLState is the Postgres SQLSTATE raised by a `FOR UPDATE
+// NOWAIT` lock attempt that would otherwise have to block, used by the
+// tx-based Refresh path (RIZ-32 M2) to detect a concurrently in-flight
+// rotation of the same refresh token row.
+const lockNotAvailableSQLState = "55P03"
 
 // DeviceInput is the client-supplied device metadata accepted by
 // register/login (always) and refresh (optionally, to refresh metadata for
@@ -88,11 +95,27 @@ type Result struct {
 	Tokens TokenPair
 }
 
+// Beginner starts a new transaction. *pgxpool.Pool satisfies this
+// interface; it is narrowed to just Begin so Service depends on the
+// smallest surface it needs.
+type Beginner interface {
+	Begin(ctx context.Context) (pgx.Tx, error)
+}
+
 // Service implements the auth business logic described in the package doc
 // comment. It depends only on storedb.Querier (not the concrete *Queries),
 // so tests can substitute an in-memory fake (see querier_test.go).
+//
+// Pool is used to run the refresh-token rotation (Refresh) and device
+// revocation (RevokeDevice) sequences inside a single database transaction,
+// per RIZ-32 M2 — it must be set to a real *pgxpool.Pool in production.
+// Unit tests that substitute a fakeQuerier for Queries leave Pool nil,
+// which is fine: fakeQuerier has no notion of concurrent transactions
+// anyway, so Refresh/RevokeDevice fall back to running the same sequence of
+// calls directly against Queries, non-transactionally, when Pool is nil.
 type Service struct {
 	Queries    storedb.Querier
+	Pool       Beginner
 	SigningKey *rsa.PrivateKey
 	Now        func() time.Time
 }
@@ -141,6 +164,11 @@ func validPassword(password string) error {
 func isUniqueViolation(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == uniqueViolationSQLState
+}
+
+func isLockNotAvailable(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == lockNotAvailableSQLState
 }
 
 func isNoRows(err error) bool {

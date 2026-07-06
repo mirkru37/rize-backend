@@ -144,6 +144,22 @@ func (f *fakeQuerier) GetRefreshTokenByHash(_ context.Context, tokenHash []byte)
 	return f.refreshTokens[id], nil
 }
 
+// GetRefreshTokenByHashForUpdate and GetRefreshTokenByHashForUpdateNoWait
+// are only meaningfully different from GetRefreshTokenByHash under real
+// Postgres row locking (RIZ-32 M2's tx-based Refresh path, exercised
+// against a real database in internal/auth/refresh_concurrency_test.go).
+// fakeQuerier has no notion of concurrent transactions, so both simply
+// delegate to the same in-memory lookup; Service only takes the
+// tx/row-locking path when Pool is non-nil, which unit tests using
+// fakeQuerier never set.
+func (f *fakeQuerier) GetRefreshTokenByHashForUpdate(ctx context.Context, tokenHash []byte) (storedb.RefreshToken, error) {
+	return f.GetRefreshTokenByHash(ctx, tokenHash)
+}
+
+func (f *fakeQuerier) GetRefreshTokenByHashForUpdateNoWait(ctx context.Context, tokenHash []byte) (storedb.RefreshToken, error) {
+	return f.GetRefreshTokenByHash(ctx, tokenHash)
+}
+
 func (f *fakeQuerier) GetUserByAppleUserID(_ context.Context, appleUserID *string) (storedb.User, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

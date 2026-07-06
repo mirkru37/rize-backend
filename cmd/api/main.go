@@ -134,10 +134,12 @@ func newRouter(logger *slog.Logger, cfg config.Config, pool *pgxpool.Pool) http.
 	}
 
 	var queries storedb.Querier
+	var beginner auth.Beginner
 	if pool != nil {
 		queries = storedb.New(pool)
+		beginner = pool
 	}
-	authService := &auth.Service{Queries: queries, SigningKey: signingKey}
+	authService := &auth.Service{Queries: queries, Pool: beginner, SigningKey: signingKey}
 	authHandler := auth.NewHandler(authService)
 
 	r.Route("/v1", func(r chi.Router) {

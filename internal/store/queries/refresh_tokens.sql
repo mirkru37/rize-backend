@@ -10,6 +10,24 @@ RETURNING *;
 SELECT * FROM refresh_tokens
 WHERE token_hash = $1;
 
+-- name: GetRefreshTokenByHashForUpdateNoWait :one
+-- Locks the refresh token row without blocking (SQLSTATE 55P03
+-- lock_not_available if another transaction already holds the lock), so the
+-- caller can distinguish "I am racing a concurrently in-flight rotation of
+-- this exact token" from "I am the only one looking at this row right now",
+-- per documentation/security.md's refresh-rotation flow (RIZ-32 M2).
+SELECT * FROM refresh_tokens
+WHERE token_hash = $1
+FOR UPDATE NOWAIT;
+
+-- name: GetRefreshTokenByHashForUpdate :one
+-- Blocking row lock, used only after GetRefreshTokenByHashForUpdateNoWait
+-- has detected contention: waits for the concurrently in-flight rotation to
+-- commit, then returns the now-serialized, final row state (RIZ-32 M2).
+SELECT * FROM refresh_tokens
+WHERE token_hash = $1
+FOR UPDATE;
+
 -- name: RotateRefreshToken :one
 UPDATE refresh_tokens
 SET revoked_at = now(),
