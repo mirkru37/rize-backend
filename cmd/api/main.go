@@ -20,6 +20,7 @@ import (
 	"github.com/mirkru37/rize-backend/internal/config"
 	"github.com/mirkru37/rize-backend/internal/httpx"
 	appmw "github.com/mirkru37/rize-backend/internal/middleware"
+	"github.com/mirkru37/rize-backend/internal/store"
 )
 
 func main() {
@@ -42,13 +43,11 @@ func run(logger *slog.Logger, cfg config.Config) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	var pool *pgxpool.Pool
-	if cfg.DatabaseURL != "" {
-		p, err := pgxpool.New(ctx, cfg.DatabaseURL)
-		if err != nil {
-			return err
-		}
-		pool = p
+	pool, err := store.NewPool(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	if pool != nil {
 		defer pool.Close()
 	}
 
