@@ -82,13 +82,21 @@ func (s *Service) Login(ctx context.Context, email, password string, device Devi
 	user, err := s.Queries.GetUserByEmail(ctx, strPtr(normalizedEmail))
 	if err != nil {
 		if isNoRows(err) {
+			// Unknown email: pay the same argon2id cost a real
+			// password-mismatch would, so this branch is not
+			// distinguishable from a wrong-password failure by timing
+			// (RIZ-32 M1).
+			verifyDecoyPassword(password)
 			return Result{}, ErrInvalidCredentials
 		}
 		return Result{}, fmt.Errorf("auth: get user by email: %w", err)
 	}
 
 	if user.PasswordHash == nil {
-		// Apple-only account: no password to check against.
+		// Apple-only account: no password to check against, but still pay
+		// the decoy verification cost for the same timing-parity reason as
+		// the unknown-email branch above (RIZ-32 M1).
+		verifyDecoyPassword(password)
 		return Result{}, ErrInvalidCredentials
 	}
 

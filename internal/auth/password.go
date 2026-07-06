@@ -95,3 +95,39 @@ func VerifyPassword(encodedHash, password string) (bool, error) {
 
 	return subtle.ConstantTimeCompare(got, want) == 1, nil
 }
+
+// decoyPasswordHash is a fixed, precomputed argon2id hash (using the same
+// parameters as HashPassword) with no corresponding real account. It exists
+// purely so failure branches that would otherwise skip password
+// verification entirely can still pay a comparable argon2id cost — see
+// verifyDecoyPassword.
+var decoyPasswordHash = mustHashDecoyPassword()
+
+func mustHashDecoyPassword() string {
+	// The actual passphrase is arbitrary and never compared against a real
+	// password; only the resulting hash's shape/cost matters.
+	hash, err := HashPassword("rize-clone-fixed-decoy-password-for-timing-parity")
+	if err != nil {
+		panic(fmt.Sprintf("auth: failed to precompute decoy password hash: %v", err))
+	}
+	return hash
+}
+
+// verifyDecoyPassword pays the same argon2id verification cost as a real
+// password check, without revealing anything about whether an account
+// exists, by comparing the caller-supplied password against a fixed decoy
+// hash and discarding the result. Login calls this on every failure branch
+// that would otherwise return ErrInvalidCredentials without ever calling
+// VerifyPassword (unknown email, password-less/Apple-only account), so
+// every failure path pays comparable argon2 cost to the
+// wrong-password-mismatch branch and doesn't leak account existence via
+// response timing, per documentation/security.md's account-enumeration
+// hardening intent (RIZ-32 M1).
+//
+// It is a package-level var (rather than a direct call to VerifyPassword)
+// so whitebox tests can install a spy to assert this path was actually
+// exercised — timing-based assertions were explicitly rejected as flaky for
+// this fix.
+var verifyDecoyPassword = func(password string) {
+	_, _ = VerifyPassword(decoyPasswordHash, password)
+}
