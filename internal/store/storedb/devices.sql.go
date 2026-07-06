@@ -157,3 +157,87 @@ func (q *Queries) TouchDeviceLastSeen(ctx context.Context, arg TouchDeviceLastSe
 	_, err := q.db.Exec(ctx, touchDeviceLastSeen, arg.ID, arg.UserID)
 	return err
 }
+
+const updateDeviceMetadata = `-- name: UpdateDeviceMetadata :one
+UPDATE devices
+SET name = $3,
+    model = $4,
+    os_version = $5,
+    app_version = $6,
+    last_seen_at = now()
+WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
+RETURNING id, user_id, platform, name, model, os_version, app_version, last_seen_at, created_at, revoked_at
+`
+
+type UpdateDeviceMetadataParams struct {
+	ID         pgtype.UUID `json:"id"`
+	UserID     pgtype.UUID `json:"user_id"`
+	Name       string      `json:"name"`
+	Model      string      `json:"model"`
+	OsVersion  string      `json:"os_version"`
+	AppVersion string      `json:"app_version"`
+}
+
+// Scoped by user_id per documentation/security.md §Tenant Isolation. Used
+// during login/refresh to refresh a previously-registered device's
+// self-reported metadata and last_seen_at, per documentation/security.md
+// §Token model ("a device row is created/updated and bound to the refresh
+// token").
+func (q *Queries) UpdateDeviceMetadata(ctx context.Context, arg UpdateDeviceMetadataParams) (Device, error) {
+	row := q.db.QueryRow(ctx, updateDeviceMetadata,
+		arg.ID,
+		arg.UserID,
+		arg.Name,
+		arg.Model,
+		arg.OsVersion,
+		arg.AppVersion,
+	)
+	var i Device
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.Platform,
+		&i.Name,
+		&i.Model,
+		&i.OsVersion,
+		&i.AppVersion,
+		&i.LastSeenAt,
+		&i.CreatedAt,
+		&i.RevokedAt,
+	)
+	return i, err
+}
+
+const updateDeviceName = `-- name: UpdateDeviceName :one
+UPDATE devices
+SET name = $3
+WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
+RETURNING id, user_id, platform, name, model, os_version, app_version, last_seen_at, created_at, revoked_at
+`
+
+type UpdateDeviceNameParams struct {
+	ID     pgtype.UUID `json:"id"`
+	UserID pgtype.UUID `json:"user_id"`
+	Name   string      `json:"name"`
+}
+
+// Scoped by user_id per documentation/security.md §Tenant Isolation. Used by
+// PATCH /v1/devices/{id} ("Rename a device" per documentation/api-reference.md
+// §Devices).
+func (q *Queries) UpdateDeviceName(ctx context.Context, arg UpdateDeviceNameParams) (Device, error) {
+	row := q.db.QueryRow(ctx, updateDeviceName, arg.ID, arg.UserID, arg.Name)
+	var i Device
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.Platform,
+		&i.Name,
+		&i.Model,
+		&i.OsVersion,
+		&i.AppVersion,
+		&i.LastSeenAt,
+		&i.CreatedAt,
+		&i.RevokedAt,
+	)
+	return i, err
+}

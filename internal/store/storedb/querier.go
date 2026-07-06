@@ -28,6 +28,16 @@ type Querier interface {
 	// authenticated as one user can never read another user's device row.
 	GetDeviceByID(ctx context.Context, arg GetDeviceByIDParams) (Device, error)
 	GetRefreshTokenByHash(ctx context.Context, tokenHash []byte) (RefreshToken, error)
+	// Blocking row lock, used only after GetRefreshTokenByHashForUpdateNoWait
+	// has detected contention: waits for the concurrently in-flight rotation to
+	// commit, then returns the now-serialized, final row state (RIZ-32 M2).
+	GetRefreshTokenByHashForUpdate(ctx context.Context, tokenHash []byte) (RefreshToken, error)
+	// Locks the refresh token row without blocking (SQLSTATE 55P03
+	// lock_not_available if another transaction already holds the lock), so the
+	// caller can distinguish "I am racing a concurrently in-flight rotation of
+	// this exact token" from "I am the only one looking at this row right now",
+	// per documentation/security.md's refresh-rotation flow (RIZ-32 M2).
+	GetRefreshTokenByHashForUpdateNoWait(ctx context.Context, tokenHash []byte) (RefreshToken, error)
 	GetUserByAppleUserID(ctx context.Context, appleUserID *string) (User, error)
 	GetUserByEmail(ctx context.Context, email *string) (User, error)
 	GetUserByID(ctx context.Context, id pgtype.UUID) (User, error)
@@ -36,10 +46,29 @@ type Querier interface {
 	// Scoped by user_id per documentation/security.md §Tenant Isolation.
 	RevokeDevice(ctx context.Context, arg RevokeDeviceParams) error
 	RevokeRefreshTokenFamily(ctx context.Context, familyID pgtype.UUID) error
+	// Scoped by user_id per documentation/security.md §Tenant Isolation: used by
+	// logout, where the caller is already authenticated and the family being
+	// revoked must belong to them.
+	RevokeRefreshTokenFamilyForUser(ctx context.Context, arg RevokeRefreshTokenFamilyForUserParams) error
+	// Scoped by user_id per documentation/security.md §Tenant Isolation. Used by
+	// DELETE /v1/devices/{id}, which must revoke every refresh token ever issued
+	// to that device (not just the currently active family) per
+	// documentation/security.md §Token model.
+	RevokeRefreshTokensByDevice(ctx context.Context, arg RevokeRefreshTokensByDeviceParams) error
 	RotateRefreshToken(ctx context.Context, arg RotateRefreshTokenParams) (RefreshToken, error)
 	SoftDeleteUser(ctx context.Context, id pgtype.UUID) error
 	// Scoped by user_id per documentation/security.md §Tenant Isolation.
 	TouchDeviceLastSeen(ctx context.Context, arg TouchDeviceLastSeenParams) error
+	// Scoped by user_id per documentation/security.md §Tenant Isolation. Used
+	// during login/refresh to refresh a previously-registered device's
+	// self-reported metadata and last_seen_at, per documentation/security.md
+	// §Token model ("a device row is created/updated and bound to the refresh
+	// token").
+	UpdateDeviceMetadata(ctx context.Context, arg UpdateDeviceMetadataParams) (Device, error)
+	// Scoped by user_id per documentation/security.md §Tenant Isolation. Used by
+	// PATCH /v1/devices/{id} ("Rename a device" per documentation/api-reference.md
+	// §Devices).
+	UpdateDeviceName(ctx context.Context, arg UpdateDeviceNameParams) (Device, error)
 	// server_seq is bumped from the same global sequence used by inserts
 	// (table DEFAULT only applies to INSERTs, so UPDATEs draw from it
 	// explicitly) per documentation/sync-protocol.md.

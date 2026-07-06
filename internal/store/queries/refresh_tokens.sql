@@ -10,6 +10,24 @@ RETURNING *;
 SELECT * FROM refresh_tokens
 WHERE token_hash = $1;
 
+-- name: GetRefreshTokenByHashForUpdateNoWait :one
+-- Locks the refresh token row without blocking (SQLSTATE 55P03
+-- lock_not_available if another transaction already holds the lock), so the
+-- caller can distinguish "I am racing a concurrently in-flight rotation of
+-- this exact token" from "I am the only one looking at this row right now",
+-- per documentation/security.md's refresh-rotation flow (RIZ-32 M2).
+SELECT * FROM refresh_tokens
+WHERE token_hash = $1
+FOR UPDATE NOWAIT;
+
+-- name: GetRefreshTokenByHashForUpdate :one
+-- Blocking row lock, used only after GetRefreshTokenByHashForUpdateNoWait
+-- has detected contention: waits for the concurrently in-flight rotation to
+-- commit, then returns the now-serialized, final row state (RIZ-32 M2).
+SELECT * FROM refresh_tokens
+WHERE token_hash = $1
+FOR UPDATE;
+
 -- name: RotateRefreshToken :one
 UPDATE refresh_tokens
 SET revoked_at = now(),
@@ -21,6 +39,23 @@ RETURNING *;
 UPDATE refresh_tokens
 SET revoked_at = now()
 WHERE family_id = $1 AND revoked_at IS NULL;
+
+-- name: RevokeRefreshTokenFamilyForUser :exec
+-- Scoped by user_id per documentation/security.md §Tenant Isolation: used by
+-- logout, where the caller is already authenticated and the family being
+-- revoked must belong to them.
+UPDATE refresh_tokens
+SET revoked_at = now()
+WHERE family_id = $1 AND user_id = $2 AND revoked_at IS NULL;
+
+-- name: RevokeRefreshTokensByDevice :exec
+-- Scoped by user_id per documentation/security.md §Tenant Isolation. Used by
+-- DELETE /v1/devices/{id}, which must revoke every refresh token ever issued
+-- to that device (not just the currently active family) per
+-- documentation/security.md §Token model.
+UPDATE refresh_tokens
+SET revoked_at = now()
+WHERE device_id = $1 AND user_id = $2 AND revoked_at IS NULL;
 
 -- name: ListActiveRefreshTokensByUser :many
 SELECT * FROM refresh_tokens
