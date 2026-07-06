@@ -52,6 +52,20 @@ const (
 	DefaultIdleTimeout = 120 * time.Second
 )
 
+// EnvVarNames lists every environment variable Load reads. It exists so
+// tooling and tests (see internal/config/env_example_test.go) can verify
+// .env.example stays in sync with what Load actually consumes; it has no
+// effect on Load's own behavior.
+var EnvVarNames = []string{
+	"PORT",
+	"ENVIRONMENT",
+	"DATABASE_URL",
+	"JWT_SIGNING_KEY",
+	"CORS_ALLOWED_ORIGINS",
+	"RATE_LIMIT_REQUESTS_PER_MINUTE",
+	"SHUTDOWN_TIMEOUT_SECONDS",
+}
+
 // Config holds rize-backend's runtime configuration, loaded from
 // environment variables at process startup.
 type Config struct {
