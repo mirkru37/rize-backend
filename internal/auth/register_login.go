@@ -158,7 +158,24 @@ func (s *Service) resolveDevice(ctx context.Context, userID pgtype.UUID, device 
 // issueTokenPair mints a fresh refresh token (a new rotation family) and a
 // matching access token for user/device, persisting the refresh token
 // hashed at rest per documentation/security.md §Token model.
+//
+// Before minting the new family, it revokes any refresh tokens already
+// active for this device, per documentation/security.md's token model
+// table ("exactly one active refresh token per device"). Without this, a
+// device that logs in twice (e.g. Login called again with the same echoed
+// device.id) would end up with two live, independently-refreshable token
+// families for the same device, which the documented contract does not
+// allow. The revoke is tenant-scoped (device.UserID via user.ID) and a
+// harmless no-op the first time a device authenticates, since it has no
+// existing tokens yet.
 func (s *Service) issueTokenPair(ctx context.Context, user storedb.User, device storedb.Device) (accessToken, refreshToken string, err error) {
+	if err := s.Queries.RevokeRefreshTokensByDevice(ctx, storedb.RevokeRefreshTokensByDeviceParams{
+		DeviceID: device.ID,
+		UserID:   user.ID,
+	}); err != nil {
+		return "", "", fmt.Errorf("auth: revoke existing device refresh tokens: %w", err)
+	}
+
 	familyID, err := newUUIDv4()
 	if err != nil {
 		return "", "", err

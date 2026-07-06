@@ -324,6 +324,69 @@ func TestDeviceTenantIsolation(t *testing.T) {
 	}
 }
 
+// TestLoginTwiceSameDevice_ExactlyOneActiveRefreshTokenPerDevice asserts
+// RIZ-32 H1's fix: documentation/security.md's token model table requires
+// "exactly one active refresh token per device". Logging in twice while
+// echoing back the same device.id (as a real client reconnecting on the
+// same device would) must revoke the first login's refresh token family,
+// leaving only the second login's token usable — and after logging out of
+// that second session, the device must have no active refresh token at
+// all.
+func TestLoginTwiceSameDevice_ExactlyOneActiveRefreshTokenPerDevice(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+	email := uniqueEmail("ivan")
+
+	registered, err := svc.Register(ctx, email, "correct-horse-battery-staple", testDevice("Ivan's MacBook"))
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	firstLoginToken := registered.Tokens.RefreshToken
+
+	// Log in again, echoing back the same device id (as documented for
+	// DeviceInput.ID: a client reconnecting to its existing device row).
+	reconnectDevice := testDevice("Ivan's MacBook")
+	reconnectDevice.ID = registered.Device.ID.String()
+
+	secondLogin, err := svc.Login(ctx, email, "correct-horse-battery-staple", reconnectDevice)
+	if err != nil {
+		t.Fatalf("second Login: %v", err)
+	}
+	if secondLogin.Device.ID != registered.Device.ID {
+		t.Fatalf("second Login resolved a different device (got %v, want %v)", secondLogin.Device.ID, registered.Device.ID)
+	}
+	secondLoginToken := secondLogin.Tokens.RefreshToken
+
+	// The first login's refresh token must now be dead: it was minted for
+	// the same device, and issuing the second login's token pair must have
+	// revoked it.
+	if _, err := svc.Refresh(ctx, firstLoginToken, nil); err == nil {
+		t.Fatal("first login's refresh token still refreshes after a second login on the same device, want an error")
+	}
+
+	// The second login's token must still work.
+	refreshed, err := svc.Refresh(ctx, secondLoginToken, nil)
+	if err != nil {
+		t.Fatalf("second login's refresh token should still be active: %v", err)
+	}
+
+	// Logging out of the (now-rotated) second session must leave the
+	// device with no active refresh token at all.
+	if err := svc.Logout(ctx, refreshed.User.ID.String(), refreshed.Tokens.RefreshToken); err != nil {
+		t.Fatalf("Logout: %v", err)
+	}
+
+	active, err := svc.Queries.ListActiveRefreshTokensByUser(ctx, refreshed.User.ID)
+	if err != nil {
+		t.Fatalf("ListActiveRefreshTokensByUser: %v", err)
+	}
+	for _, rt := range active {
+		if rt.DeviceID == registered.Device.ID {
+			t.Fatalf("device %v still has an active refresh token after double-login + logout: %+v", registered.Device.ID, rt)
+		}
+	}
+}
+
 // TestRevokeDeviceRevokesRefreshTokens asserts DELETE /v1/devices/{id}'s
 // service method revokes every refresh token issued to that device, per
 // documentation/api-reference.md §Devices.
