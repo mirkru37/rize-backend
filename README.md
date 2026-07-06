@@ -36,6 +36,19 @@ migrate -path internal/store/migrations -database "$DATABASE_URL" up
 go run ./cmd/api
 ```
 
+## Configuration
+
+All runtime configuration is read from environment variables by `internal/config` — there is no config-file format. `.env.example` at the repo root documents every variable `config.Load()` reads, with safe example values and a comment explaining each one.
+
+```
+cp .env.example .env
+```
+
+`internal/config/env_example_test.go` enforces that `.env.example` stays complete: it fails if `config.Load()` reads a variable that `.env.example` doesn't document.
+
+- **Running the binary on the host** (`go run ./cmd/api`): the process does not auto-load `.env` (no dotenv library is wired in), so export the variables into your shell first, e.g. `set -a && source .env && set +a`.
+- **`docker compose up`**: the `api` service reads `.env` if present, via `env_file: { path: .env, required: false }` — so `JWT_SIGNING_KEY`, `CORS_ALLOWED_ORIGINS`, and other variables from a copied `.env` are picked up by compose. `PORT` and `DATABASE_URL` are still set explicitly in the `environment:` block, and compose gives `environment:` precedence over `env_file:`, so those two stay compose-overridden by design — the container needs `PORT=8080` and the container-network `DATABASE_URL` (host `db`), not a localhost DSN from a host-oriented `.env`.
+
 ## Documentation
 
 Contracts live in the master repo and are the source of truth:

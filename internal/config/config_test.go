@@ -11,16 +11,7 @@ import (
 // execution order, restoring the original values on test cleanup.
 func clearEnv(t *testing.T) {
 	t.Helper()
-	keys := []string{
-		"PORT",
-		"ENVIRONMENT",
-		"DATABASE_URL",
-		"JWT_SIGNING_KEY",
-		"CORS_ALLOWED_ORIGINS",
-		"RATE_LIMIT_REQUESTS_PER_MINUTE",
-		"SHUTDOWN_TIMEOUT_SECONDS",
-	}
-	for _, k := range keys {
+	for _, k := range EnvVarNames {
 		orig, had := os.LookupEnv(k)
 		_ = os.Unsetenv(k)
 		t.Cleanup(func() {

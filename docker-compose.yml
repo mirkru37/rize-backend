@@ -40,6 +40,9 @@ services:
         condition: service_completed_successfully
     ports:
       - "8080:8080"
+    env_file:
+      - path: .env
+        required: false
     environment:
       PORT: "8080"
       DATABASE_URL: "postgres://rize:rize@db:5432/rize?sslmode=disable"
