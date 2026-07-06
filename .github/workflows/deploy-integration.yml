@@ -1,0 +1,158 @@
+name: Deploy Integration
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: deploy-integration
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AR_REPO: rize-backend
+  API_JOB_ENVIRONMENT: staging # see internal/config: valid ENVIRONMENT values are development, staging, production — there is no literal "integration" value.
+
+jobs:
+  # Guard job: runs unconditionally and first. If the repo has not been
+  # GCP-bootstrapped yet (no GCP_PROJECT_ID secret), it logs a clear message
+  # and exits 0 so pushes to main never fail CI pre-bootstrap. All later jobs
+  # are gated on its `configured` output.
+  guard:
+    name: Guard - GCP bootstrap check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      configured: ${{ steps.check.outputs.configured }}
+    steps:
+      - name: Check GCP_PROJECT_ID secret
+        id: check
+        env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+        run: |
+          if [ -z "${GCP_PROJECT_ID}" ]; then
+            echo "deploy skipped — GCP not bootstrapped (GCP_PROJECT_ID secret unset). See docs/deployment.md for the bootstrap procedure."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "GCP_PROJECT_ID is set — proceeding with integration deploy."
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-and-push:
+    name: Build and push images
+    needs: guard
+    if: needs.guard.outputs.configured == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      api-image: ${{ steps.vars.outputs.api-image }}
+      migrate-image: ${{ steps.vars.outputs.migrate-image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        name: Authenticate to Google Cloud (Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker "${{ secrets.GCP_REGION }}-docker.pkg.dev" --quiet
+
+      - name: Compute image references
+        id: vars
+        run: |
+          API_IMAGE="${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${AR_REPO}/api"
+          MIGRATE_IMAGE="${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${AR_REPO}/migrate"
+          echo "api-image=${API_IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "migrate-image=${MIGRATE_IMAGE}" >> "$GITHUB_OUTPUT"
+
+      - name: Build API image
+        run: docker build -f Dockerfile -t "${{ steps.vars.outputs.api-image }}:${{ github.sha }}" -t "${{ steps.vars.outputs.api-image }}:integration" .
+
+      - name: Build migration image
+        run: docker build -f Dockerfile.migrate -t "${{ steps.vars.outputs.migrate-image }}:${{ github.sha }}" -t "${{ steps.vars.outputs.migrate-image }}:integration" .
+
+      - name: Push API image
+        run: docker push --all-tags "${{ steps.vars.outputs.api-image }}"
+
+      - name: Push migration image
+        run: docker push --all-tags "${{ steps.vars.outputs.migrate-image }}"
+
+  migrate:
+    name: Run integration DB migrations
+    needs: [guard, build-and-push]
+    if: needs.guard.outputs.configured == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - id: auth
+        name: Authenticate to Google Cloud (Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Deploy migration Cloud Run Job
+        run: |
+          gcloud run jobs deploy rize-backend-migrate-integration \
+            --image="${{ needs.build-and-push.outputs.migrate-image }}:${{ github.sha }}" \
+            --region="${{ secrets.GCP_REGION }}" \
+            --project="${{ secrets.GCP_PROJECT_ID }}" \
+            --service-account="rize-backend-runtime@${{ secrets.GCP_PROJECT_ID }}.iam.gserviceaccount.com" \
+            --set-secrets="DATABASE_URL=${{ secrets.INTEGRATION_DATABASE_URL_SECRET }}" \
+            --quiet
+
+      - name: Execute migration job and wait for completion
+        run: |
+          gcloud run jobs execute rize-backend-migrate-integration \
+            --region="${{ secrets.GCP_REGION }}" \
+            --project="${{ secrets.GCP_PROJECT_ID }}" \
+            --wait
+
+  deploy:
+    name: Deploy Cloud Run service
+    needs: [guard, build-and-push, migrate]
+    if: needs.guard.outputs.configured == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - id: auth
+        name: Authenticate to Google Cloud (Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Deploy rize-backend-integration
+        run: |
+          gcloud run deploy rize-backend-integration \
+            --image="${{ needs.build-and-push.outputs.api-image }}:${{ github.sha }}" \
+            --region="${{ secrets.GCP_REGION }}" \
+            --project="${{ secrets.GCP_PROJECT_ID }}" \
+            --service-account="rize-backend-runtime@${{ secrets.GCP_PROJECT_ID }}.iam.gserviceaccount.com" \
+            --allow-unauthenticated \
+            --max-instances=2 \
+            --set-env-vars="^@@^ENVIRONMENT=${{ env.API_JOB_ENVIRONMENT }}@@CORS_ALLOWED_ORIGINS=${{ vars.INTEGRATION_CORS_ALLOWED_ORIGINS }}" \
+            --set-secrets="DATABASE_URL=${{ secrets.INTEGRATION_DATABASE_URL_SECRET }},JWT_SIGNING_KEY=${{ secrets.INTEGRATION_JWT_SIGNING_KEY_SECRET }}" \
+            --quiet

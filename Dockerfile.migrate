@@ -1,0 +1,35 @@
+# syntax=docker/dockerfile:1
+#
+# Migration image for rize-backend deployments (RIZ-36).
+#
+# This mirrors the docker-compose `migrate` service (see docker-compose.yml
+# and documentation/architecture-backend.md §Containerization and Local
+# Development): a one-shot golang-migrate run against the migrations in
+# internal/store/migrations. It is deliberately a separate image from the
+# one built by Dockerfile — the application image only contains the API
+# binary (per Dockerfile's runtime stage), not golang-migrate or the
+# migrations directory. This image is built and tagged alongside the app
+# image (same git SHA) in CI, and run as a Cloud Run Job; see
+# .github/workflows/deploy-integration.yml and
+# .github/workflows/deploy-production.yml.
+#
+# The official migrate/migrate image is built FROM scratch (no shell), which
+# makes it impossible to expand a DATABASE_URL environment variable into the
+# "-database" flag at container start. This image re-packages the same
+# migrate binary onto a minimal Alpine base with a shell entrypoint so the
+# database URL can be injected via Cloud Run's --set-secrets at Job-run time
+# rather than baked into the image or passed as a literal Job arg.
+FROM migrate/migrate:v4.17.1 AS migrate-bin
+
+FROM alpine:3.20
+
+RUN apk add --no-cache ca-certificates
+
+COPY --from=migrate-bin /usr/local/bin/migrate /usr/local/bin/migrate
+COPY internal/store/migrations /migrations
+
+# DATABASE_URL is expected to be set as an environment variable (e.g. via
+# Cloud Run's --set-secrets) at Job-run time. Any arguments passed to the
+# container (e.g. "up") are forwarded to migrate after the -database flag.
+ENTRYPOINT ["/bin/sh", "-c", "exec migrate -path /migrations -database \"$DATABASE_URL\" \"$@\"", "--"]
+CMD ["up"]
