@@ -148,4 +148,48 @@ func TestLogin_DecoyPasswordVerification(t *testing.T) {
 			t.Fatalf("verifyDecoyPassword call count = %d, want 0 (wrong-password branch verifies against the real hash)", calls)
 		}
 	})
+
+	t.Run("oversized password is rejected before any argon2id work", func(t *testing.T) {
+		// RIZ-32 HIGH-1 follow-up: Login must reject a >1024-byte password
+		// before it ever reaches the decoy or real VerifyPassword paths, so
+		// an unauthenticated caller can't force expensive argon2id work
+		// (or the decoy hash's equally expensive argon2id work) just by
+		// sending an oversized password. Extends the M1 decoy spy to
+		// assert zero argon2 invocations; GetUserByEmail is stubbed to
+		// fail the test outright if Login ever reaches it, proving the
+		// length check short-circuits before any DB lookup or hashing.
+		var decoyCalls int
+		orig := verifyDecoyPassword
+		verifyDecoyPassword = func(_ string) { decoyCalls++ }
+		t.Cleanup(func() { verifyDecoyPassword = orig })
+
+		svc := &Service{
+			Queries: stubQuerier{
+				getUserByEmail: func(_ context.Context, _ *string) (storedb.User, error) {
+					t.Fatal("Login reached GetUserByEmail for an oversized password; the length check should have short-circuited first")
+					return storedb.User{}, nil
+				},
+			},
+			SigningKey: testSigningKeyInternal(t),
+		}
+
+		oversized := make([]byte, maxPasswordBytes+1)
+		for i := range oversized {
+			oversized[i] = 'a'
+		}
+
+		_, err := svc.Login(context.Background(), "real-user@example.com", string(oversized), DeviceInput{
+			Platform:   "macos",
+			Name:       "Test Device",
+			Model:      "MacBookPro18,1",
+			OSVersion:  "14.5",
+			AppVersion: "1.0.0",
+		})
+		if !errors.Is(err, ErrInvalidCredentials) {
+			t.Fatalf("Login error = %v, want ErrInvalidCredentials (same envelope as every other login failure)", err)
+		}
+		if decoyCalls != 0 {
+			t.Fatalf("verifyDecoyPassword call count = %d, want 0: an oversized password must be rejected before any argon2id work, including the decoy", decoyCalls)
+		}
+	})
 }

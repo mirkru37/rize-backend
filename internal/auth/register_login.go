@@ -72,7 +72,22 @@ func (s *Service) Login(ctx context.Context, email, password string, device Devi
 	if err != nil {
 		return Result{}, err
 	}
-	if password == "" {
+	if password == "" || len(password) > maxPasswordBytes {
+		// Reject an oversized password before it ever reaches argon2id
+		// (RIZ-32 M3/HIGH-1 follow-up): unlike the unknown-email and
+		// password-less-account branches below, this short-circuit does
+		// NOT reopen a timing oracle. Those branches must still pay the
+		// decoy argon2id cost because skipping it would let an attacker
+		// distinguish "no such account" from "wrong password" by timing.
+		// Here, the only thing an early return leaks is that the
+		// *attacker's own request* had more than maxPasswordBytes of
+		// password — a fact they already know, not a signal about
+		// account existence or credential correctness — so there is
+		// nothing to protect by paying the decoy cost, and doing so would
+		// just be an easy unauthenticated argon2id-flooding DoS vector.
+		// The error is ErrInvalidCredentials (not ErrValidation) so the
+		// response is identical in shape to every other login failure and
+		// does not become a new enumeration signal.
 		return Result{}, ErrInvalidCredentials
 	}
 	if err := device.validate(); err != nil {
