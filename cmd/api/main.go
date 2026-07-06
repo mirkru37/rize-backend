@@ -58,6 +58,9 @@ func run(logger *slog.Logger, cfg config.Config) error {
 		Addr:              ":" + cfg.HTTPPort,
 		Handler:           router,
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       cfg.ReadTimeout,
+		WriteTimeout:      cfg.WriteTimeout,
+		IdleTimeout:       cfg.IdleTimeout,
 	}
 
 	errCh := make(chan error, 1)
@@ -90,19 +93,24 @@ func run(logger *slog.Logger, cfg config.Config) error {
 
 // newRouter builds the Chi router with the middleware chain applied in the
 // exact order mandated by documentation/architecture-backend.md §Middleware
-// Stack: RequestID -> RealIP -> Logging -> Recoverer -> CORS -> RateLimit
-// -> (Auth -> RBAC, not implemented by this ticket). Ops endpoints
-// (/healthz, /readyz, /metrics) are unversioned and sit outside that
-// stack's CORS/rate-limit/auth concerns per documentation/api-reference.md
-// §Ops; all future business routes are mounted under /v1.
+// Stack: RequestID -> Logging -> Recoverer -> CORS -> RateLimit -> (Auth ->
+// RBAC, not implemented by this ticket). Ops endpoints (/healthz, /readyz,
+// /metrics) are unversioned and sit outside that stack's
+// CORS/rate-limit/auth concerns per documentation/api-reference.md §Ops;
+// all future business routes are mounted under /v1.
+//
+// RIZ-30 fix note: chi's RealIP middleware was removed from this stack —
+// see the package doc comment in internal/middleware/doc.go for why.
 func newRouter(logger *slog.Logger, cfg config.Config, pool *pgxpool.Pool) http.Handler {
 	r := chi.NewRouter()
 
 	r.Use(appmw.RequestID)
-	r.Use(appmw.RealIP)
 	r.Use(appmw.Logging(logger))
 	r.Use(appmw.Recoverer)
 	r.Use(httpx.Metrics())
+
+	r.NotFound(notFoundHandler)
+	r.MethodNotAllowed(methodNotAllowedHandler)
 
 	r.Get("/healthz", healthzHandler)
 	r.Get("/readyz", readyzHandler(pool, cfg.ReadyzDBPingTimeout))
@@ -120,6 +128,29 @@ func newRouter(logger *slog.Logger, cfg config.Config, pool *pgxpool.Pool) http.
 	})
 
 	return r
+}
+
+// notFoundHandler writes the standard RFC 7807-style Problem body for
+// requests that don't match any registered route, instead of chi's default
+// plain-text 404 body, per documentation/api-reference.md §Conventions
+// ("every error response uses the Problem envelope").
+func notFoundHandler(w http.ResponseWriter, r *http.Request) {
+	httpx.WriteError(w, r, http.StatusNotFound,
+		"https://api.rize-clone.example/errors/not-found",
+		"Not Found",
+		"The requested resource does not exist.",
+	)
+}
+
+// methodNotAllowedHandler writes the standard RFC 7807-style Problem body
+// for requests whose method isn't allowed on an otherwise-matched route,
+// instead of chi's default plain-text 405 body.
+func methodNotAllowedHandler(w http.ResponseWriter, r *http.Request) {
+	httpx.WriteError(w, r, http.StatusMethodNotAllowed,
+		"https://api.rize-clone.example/errors/method-not-allowed",
+		"Method Not Allowed",
+		"The HTTP method is not allowed for the requested resource.",
+	)
 }
 
 func healthzHandler(w http.ResponseWriter, r *http.Request) {
