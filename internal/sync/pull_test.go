@@ -574,3 +574,138 @@ func TestPullXminHorizonExcludesRaceWithLowerServerSeq(t *testing.T) {
 		t.Fatalf("the higher-server_seq row was never delivered across either pull")
 	}
 }
+
+// TestPullReversedInterleavingCommitOrderedCursor is the H1 RE-REVIEW
+// regression test (RIZ-34): it reproduces the residual gap the original
+// xmin-horizon-gate-plus-server_seq-cursor fix left open — a REVERSED
+// interleaving where the COMMITTED row has the LOWER xid but the HIGHER
+// server_seq, while the row still IN FLIGHT has the HIGHER xid but the
+// LOWER server_seq (live repro this fix targets: committed seq=2061/
+// xmin=4031 delivered, in-flight seq=2060/xmin=4032 skipped forever).
+//
+// This is the opposite shape from
+// TestPullXminHorizonExcludesRaceWithLowerServerSeq above, which has the
+// in-flight row assigned BOTH a lower xid AND a lower server_seq (the
+// horizon gate alone already handles that ordinary case, since the
+// in-flight transaction's own xid IS the snapshot horizon). Here, the
+// in-flight transaction's xid is deliberately made HIGHER while its row's
+// server_seq is made LOWER, which is exactly the shape where a
+// server_seq-only cursor advances past the in-flight row's eventual
+// position and permanently skips it once it commits — proving the fix
+// requires anchoring the pagination key to the tuple (xid8, server_seq),
+// not just gating delivery on xid8.
+//
+// Deterministic construction via two pooled connections with explicit
+// BEGIN/COMMIT ordering (no sleeps):
+//  1. txC (the eventually-committed transaction) BEGINs and calls
+//     pg_current_xact_id(), which assigns it a real xid immediately (even
+//     though it has not written anything yet) — this xid is the LOWEST of
+//     the two because txC acquires it first.
+//  2. txI (the row that stays in-flight through the race) BEGINs and also
+//     calls pg_current_xact_id() — its xid is guaranteed HIGHER than
+//     txC's, since xids are assigned monotonically and txC already has
+//     one.
+//  3. txI INSERTs its row FIRST (before txC inserts anything), so the
+//     server_seq trigger's nextval() call assigns txI's row the LOWER
+//     server_seq of the two — even though txI holds the HIGHER xid.
+//  4. txC INSERTs its row SECOND (drawing a HIGHER server_seq than txI's
+//     row) and COMMITs immediately, so it is fully settled with a LOWER
+//     xid but a HIGHER server_seq than the still-open txI.
+//  5. txI remains uncommitted through the assertions below, then commits.
+func TestPullReversedInterleavingCommitOrderedCursor(t *testing.T) {
+	pool := testPool(t)
+	q := storedb.New(pool)
+	user, _ := newUser(t, q)
+	svc := &Service{Queries: q, Pool: pool}
+	ctx := context.Background()
+
+	txC, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin txC: %v", err)
+	}
+	if _, err := txC.Exec(ctx, `SELECT pg_current_xact_id()`); err != nil {
+		t.Fatalf("assign txC's xid: %v", err)
+	}
+
+	txI, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin txI: %v", err)
+	}
+	if _, err := txI.Exec(ctx, `SELECT pg_current_xact_id()`); err != nil {
+		t.Fatalf("assign txI's xid: %v", err)
+	}
+
+	// txI inserts first: its row draws the LOWER server_seq despite txI
+	// holding the HIGHER xid (assigned above, after txC's).
+	inFlightID := newUUIDv7(t)
+	if _, err := txI.Exec(ctx, `
+		INSERT INTO tags (id, user_id, name, updated_at) VALUES ($1, $2, $3, now())`,
+		mustParseUUID(t, inFlightID), user.ID, "reversed-inflight-"+randomSuffix(t)); err != nil {
+		t.Fatalf("insert in-flight row: %v", err)
+	}
+
+	// txC inserts second (drawing a HIGHER server_seq than txI's row above)
+	// and commits immediately: fully settled, LOWER xid, HIGHER server_seq
+	// than the still-open txI.
+	committedID := newUUIDv7(t)
+	if _, err := txC.Exec(ctx, `
+		INSERT INTO tags (id, user_id, name, updated_at) VALUES ($1, $2, $3, now())`,
+		mustParseUUID(t, committedID), user.ID, "reversed-committed-"+randomSuffix(t)); err != nil {
+		t.Fatalf("insert committed row: %v", err)
+	}
+	if err := txC.Commit(ctx); err != nil {
+		t.Fatalf("commit txC: %v", err)
+	}
+
+	// While txI is still open: the committed row (server_seq=high,
+	// xid=low) is delivered (its xid is below the snapshot horizon, which
+	// sits at txI's xid since txI is the only in-flight transaction), and
+	// the in-flight row must not be delivered at all. The critical
+	// assertion is what happens AFTER txI commits (below): a server_seq-
+	// only cursor computed from this page would be pinned at the
+	// committed row's (higher) server_seq, permanently excluding txI's
+	// (lower-server_seq) row once it commits.
+	duringRace, err := svc.pull(ctx, userIDString(user), "", 500)
+	if err != nil {
+		t.Fatalf("pull (during reversed race): %v", err)
+	}
+	foundCommitted := false
+	for _, u := range duringRace.Changes["tags"].Upserts {
+		dto := u.(tagUpsertDTO)
+		if dto.ID == inFlightID {
+			t.Fatalf("pull delivered the in-flight (uncommitted) row")
+		}
+		if dto.ID == committedID {
+			foundCommitted = true
+		}
+	}
+	if !foundCommitted {
+		t.Fatalf("pull did not deliver the already-committed row (server_seq=high, xid=low)")
+	}
+
+	if err := txI.Commit(ctx); err != nil {
+		t.Fatalf("commit txI: %v", err)
+	}
+
+	// Re-pull from the cursor the racy pull returned: the in-flight row
+	// (now committed, server_seq=low, xid=high) must be delivered. This is
+	// the assertion that fails against a server_seq-only cursor: the
+	// in-flight row's server_seq is LOWER than the cursor boundary (the
+	// already-delivered committed row's server_seq), so "server_seq >
+	// cursor" would never admit it again. The (xid8, server_seq)-tuple
+	// cursor admits it because its xid8 (the leading key) is higher than
+	// the cursor's xid8 component, regardless of its server_seq.
+	afterCommit, err := svc.pull(ctx, userIDString(user), duringRace.NextCursor, 500)
+	if err != nil {
+		t.Fatalf("pull (after commit): %v", err)
+	}
+	foundInFlight := false
+	for _, u := range afterCommit.Changes["tags"].Upserts {
+		if u.(tagUpsertDTO).ID == inFlightID {
+			foundInFlight = true
+		}
+	}
+	if !foundInFlight {
+		t.Fatalf("the reversed-interleaving row (lower server_seq, higher xid) was permanently skipped once committed — next_cursor advanced past it")
+	}
+}

@@ -277,7 +277,7 @@ func (f *fakeQuerier) ListTagsForUser(context.Context, storedb.ListTagsForUserPa
 	return nil, errNotImplementedByFakeQuerier
 }
 
-func (f *fakeQuerier) ListUserAppSettingChangesForUser(context.Context, storedb.ListUserAppSettingChangesForUserParams) ([]storedb.UserAppSetting, error) {
+func (f *fakeQuerier) ListUserAppSettingChangesForUser(context.Context, storedb.ListUserAppSettingChangesForUserParams) ([]storedb.ListUserAppSettingChangesForUserRow, error) {
 	return nil, errNotImplementedByFakeQuerier
 }
 
