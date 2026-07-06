@@ -50,17 +50,16 @@ type activityEventData struct {
 	Deleted     bool    `json:"deleted"`
 }
 
-// focusSessionData mirrors the "focus_session" entity's "data" object.
-//
-// Contract clarification (relayed by the orchestrator after the mobile
-// sync review): documentation/sync-protocol.md §Push's worked example is
-// wrong where it diverges from documentation/database-schema.md —
-// database-schema.md is canonical. The example's `label` field and its
-// omission of `kind`/`status` do not match the schema; this implementation
-// uses the schema's actual field names (`note`, not `label`) and requires
-// `kind`, `status`, and `planned_duration_s`, matching what the mobile
-// client already sends. A doc PR reconciling sync-protocol.md is being
-// handled separately.
+// focusSessionData mirrors the "focus_session" entity's "data" object from
+// documentation/sync-protocol.md §Push's worked example, which already
+// uses `kind`, `status`, and `note` — the same field names as
+// documentation/database-schema.md's `focus_sessions` table. `id` and
+// `updated_at` are required per the doc ("For mutable entities, data.id and
+// data.updated_at are required on every item, including tombstones").
+// `planned_duration_s` is an additive field (present in database-schema.md
+// but not shown in the doc's worked example) needed to populate that
+// column; it is optional here so a doc-conformant client that omits it
+// still works.
 type focusSessionData struct {
 	ID               string  `json:"id"`
 	UpdatedAt        string  `json:"updated_at"`
