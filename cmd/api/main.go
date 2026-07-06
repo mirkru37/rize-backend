@@ -5,7 +5,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -15,33 +14,37 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
-)
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
-const (
-	defaultPort         = "8080"
-	shutdownTimeout     = 10 * time.Second
-	readyzDBPingTimeout = 5 * time.Second
+	"github.com/mirkru37/rize-backend/internal/config"
+	"github.com/mirkru37/rize-backend/internal/httpx"
+	appmw "github.com/mirkru37/rize-backend/internal/middleware"
 )
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
 
-	if err := run(logger); err != nil {
+	cfg, err := config.Load()
+	if err != nil {
+		logger.Error("failed to load config", "error", err)
+		os.Exit(1)
+	}
+
+	if err := run(logger, cfg); err != nil {
 		logger.Error("server exited with error", "error", err)
 		os.Exit(1)
 	}
 }
 
-func run(logger *slog.Logger) error {
+func run(logger *slog.Logger, cfg config.Config) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	var pool *pgxpool.Pool
-	if dsn := os.Getenv("DATABASE_URL"); dsn != "" {
-		p, err := pgxpool.New(ctx, dsn)
+	if cfg.DatabaseURL != "" {
+		p, err := pgxpool.New(ctx, cfg.DatabaseURL)
 		if err != nil {
 			return err
 		}
@@ -49,22 +52,17 @@ func run(logger *slog.Logger) error {
 		defer pool.Close()
 	}
 
-	router := newRouter(logger, pool)
-
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = defaultPort
-	}
+	router := newRouter(logger, cfg, pool)
 
 	srv := &http.Server{
-		Addr:              ":" + port,
+		Addr:              ":" + cfg.HTTPPort,
 		Handler:           router,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
 	errCh := make(chan error, 1)
 	go func() {
-		logger.Info("starting server", "addr", srv.Addr)
+		logger.Info("starting server", "addr", srv.Addr, "environment", cfg.Environment)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 			return
@@ -79,7 +77,7 @@ func run(logger *slog.Logger) error {
 		logger.Info("shutdown signal received")
 	}
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
@@ -90,72 +88,62 @@ func run(logger *slog.Logger) error {
 	return nil
 }
 
-// newRouter builds the Chi router with the middleware chain applied in
-// order: RequestID -> RealIP -> structured logging -> Recoverer.
-func newRouter(logger *slog.Logger, pool *pgxpool.Pool) http.Handler {
+// newRouter builds the Chi router with the middleware chain applied in the
+// exact order mandated by documentation/architecture-backend.md §Middleware
+// Stack: RequestID -> RealIP -> Logging -> Recoverer -> CORS -> RateLimit
+// -> (Auth -> RBAC, not implemented by this ticket). Ops endpoints
+// (/healthz, /readyz, /metrics) are unversioned and sit outside that
+// stack's CORS/rate-limit/auth concerns per documentation/api-reference.md
+// §Ops; all future business routes are mounted under /v1.
+func newRouter(logger *slog.Logger, cfg config.Config, pool *pgxpool.Pool) http.Handler {
 	r := chi.NewRouter()
 
-	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIP) //nolint:staticcheck // RealIP is required by the mandated middleware order; the service does not sit behind an untrusted proxy at this scaffolding stage.
-	r.Use(requestLogger(logger))
-	r.Use(middleware.Recoverer)
+	r.Use(appmw.RequestID)
+	r.Use(appmw.RealIP)
+	r.Use(appmw.Logging(logger))
+	r.Use(appmw.Recoverer)
+	r.Use(httpx.Metrics())
 
 	r.Get("/healthz", healthzHandler)
-	r.Get("/readyz", readyzHandler(pool))
+	r.Get("/readyz", readyzHandler(pool, cfg.ReadyzDBPingTimeout))
+	r.Handle("/metrics", promhttp.Handler())
+
+	r.Route("/v1", func(r chi.Router) {
+		r.Use(appmw.CORS(appmw.CORSConfig{AllowedOrigins: cfg.CORSAllowedOrigins}))
+		r.Use(appmw.RateLimit(cfg.RateLimitRequestsPerMinute))
+
+		// Business routes (auth, users, devices, sync, activities,
+		// reports, projects, tags, categories, focus-sessions, admin)
+		// are attached here by future tickets, once Auth/RBAC
+		// middleware exists. RIZ-30 only establishes the /v1 mount
+		// point itself.
+	})
 
 	return r
 }
 
-// requestLogger returns middleware that logs each request with structured
-// (slog) key-value fields once the request has completed.
-func requestLogger(logger *slog.Logger) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-			start := time.Now()
-			ww := middleware.NewWrapResponseWriter(w, req.ProtoMajor)
-
-			next.ServeHTTP(ww, req)
-
-			logger.Info("request",
-				"method", req.Method,
-				"path", req.URL.Path,
-				"status", ww.Status(),
-				"bytes", ww.BytesWritten(),
-				"duration_ms", time.Since(start).Milliseconds(),
-				"request_id", middleware.GetReqID(req.Context()),
-			)
-		})
-	}
+func healthzHandler(w http.ResponseWriter, r *http.Request) {
+	httpx.WriteJSON(w, r, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-func writeJSON(w http.ResponseWriter, status int, payload any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(payload)
-}
-
-func healthzHandler(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-}
-
-// readyzHandler reports readiness: if DATABASE_URL is configured it pings
-// the database via the pgx pool and reports 200/503 accordingly; if no
-// database is configured it reports 200 with db: "not_configured".
-func readyzHandler(pool *pgxpool.Pool) http.HandlerFunc {
+// readyzHandler reports readiness: if a database pool is configured it
+// pings the database and reports 200/503 accordingly; if no database is
+// configured it reports 200 with db: "not_configured".
+func readyzHandler(pool *pgxpool.Pool, pingTimeout time.Duration) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if pool == nil {
-			writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "db": "not_configured"})
+			httpx.WriteJSON(w, r, http.StatusOK, map[string]string{"status": "ok", "db": "not_configured"})
 			return
 		}
 
-		ctx, cancel := context.WithTimeout(r.Context(), readyzDBPingTimeout)
+		ctx, cancel := context.WithTimeout(r.Context(), pingTimeout)
 		defer cancel()
 
 		if err := pool.Ping(ctx); err != nil {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unavailable", "db": "unreachable"})
+			httpx.WriteJSON(w, r, http.StatusServiceUnavailable, map[string]string{"status": "unavailable", "db": "unreachable"})
 			return
 		}
 
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "db": "ok"})
+		httpx.WriteJSON(w, r, http.StatusOK, map[string]string{"status": "ok", "db": "ok"})
 	}
 }
