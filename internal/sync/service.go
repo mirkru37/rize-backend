@@ -33,6 +33,19 @@ var validActivityType = map[string]bool{
 	"manual":       true,
 }
 
+// defaultActivityType is substituted for `type` when a client omits it.
+// documentation/sync-protocol.md §Push's worked request example for
+// activity_event doesn't include `type`, but the underlying
+// activity_events.type column is declared NOT NULL by the deployed schema
+// (internal/store/migrations/000011_create_activity_events.up.sql) even
+// though database-schema.md's table description only documents its CHECK
+// constraint. To keep a doc-conformant client (one that never sends
+// `type`) fully functional against that NOT NULL column, an omitted `type`
+// defaults to the safest inert value, "manual", rather than guessing at
+// automatic-tracking behavior (e.g. "app_active") the client never
+// reported.
+const defaultActivityType = "manual"
+
 var validPrecision = map[string]bool{
 	"exact":       true,
 	"approximate": true,
@@ -165,8 +178,15 @@ func (s *Service) applyActivityEvent(ctx context.Context, userID, deviceID pgtyp
 	if !validPrecision[data.Precision] {
 		return invalidActivityEvent(index, data.EventID, "VALIDATION_ERROR", "precision must be \"exact\" or \"approximate\""), nil
 	}
-	if !validActivityType[data.Type] {
-		return invalidActivityEvent(index, data.EventID, "VALIDATION_ERROR", "type must be one of app_active, idle, locked, mobile_usage, manual"), nil
+	// type is optional on the wire (see dto.go); an omitted value defaults
+	// to defaultActivityType, but an explicitly-supplied value must still
+	// be one of the documented enum values.
+	eventType := defaultActivityType
+	if data.Type != nil {
+		if !validActivityType[*data.Type] {
+			return invalidActivityEvent(index, data.EventID, "VALIDATION_ERROR", "type must be one of app_active, idle, locked, mobile_usage, manual"), nil
+		}
+		eventType = *data.Type
 	}
 
 	app, err := s.resolveApp(ctx, data.AppBundleID, platform)
@@ -185,7 +205,7 @@ func (s *Service) applyActivityEvent(ctx context.Context, userID, deviceID pgtyp
 		DeviceID:    deviceID,
 		StartedAt:   pgtype.Timestamptz{Time: startedAt, Valid: true},
 		EndedAt:     pgtype.Timestamptz{Time: endedAt, Valid: true},
-		Type:        data.Type,
+		Type:        eventType,
 		Source:      source,
 		Precision:   data.Precision,
 		AppID:       app.ID,

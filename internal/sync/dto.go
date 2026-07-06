@@ -21,24 +21,18 @@ type pushItem struct {
 }
 
 // activityEventData mirrors the "activity_event" entity's "data" object
-// from documentation/sync-protocol.md §Push.
-//
-// RIZ-33 assumption / documented gap: the protocol doc's worked example
-// for activity_event omits `type`, one of database-schema.md's NOT NULL
-// `activity_events.type` CHECK values (`app_active`, `idle`, `locked`,
-// `mobile_usage`, `manual` — see architecture-desktop.md's persistence
-// mapping, which is unambiguously client-determined and cannot be derived
-// server-side from any other field in the documented payload). This
-// implementation adds `type` as a required field so the NOT NULL column
-// can be populated at all. `source` (`desktop`/`mobile`/`manual`) is NOT
-// added to the wire payload: it is derived server-side from the
+// from documentation/sync-protocol.md §Push, whose worked example does not
+// include a `type` field. `type` (one of `app_active`/`idle`/`locked`/
+// `mobile_usage`/`manual`, per database-schema.md's CHECK constraint) is
+// kept in the wire schema as an additive, OPTIONAL field: a doc-conformant
+// client that never sends `type` still works end-to-end (the service layer
+// defaults an omitted `type` to `"manual"`, see service.go); a client that
+// does send `type` gets it validated against the enum and rejected as
+// "invalid" if it's outside it. `source` (`desktop`/`mobile`/`manual`) is
+// NOT added to the wire payload: it is derived server-side from the
 // authenticated device's `platform` column (`macos` -> `desktop`, `ios` ->
 // `mobile`), since that already lives in `devices` and doesn't need to be
-// re-supplied by the client. This gap and the resolution taken here are
-// called out as a blocker/assumption in the RIZ-33 PR description; a
-// document-writer follow-up should add `type` to sync-protocol.md's
-// worked example in the same cycle per rize-backend/CLAUDE.md's contract
-// rule.
+// re-supplied by the client.
 type activityEventData struct {
 	EventID     string  `json:"event_id"`
 	StartedAt   string  `json:"started_at"`
@@ -46,7 +40,7 @@ type activityEventData struct {
 	AppBundleID string  `json:"app_bundle_id"`
 	WindowTitle *string `json:"window_title"`
 	Precision   string  `json:"precision"`
-	Type        string  `json:"type"`
+	Type        *string `json:"type,omitempty"`
 	Deleted     bool    `json:"deleted"`
 }
 

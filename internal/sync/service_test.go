@@ -88,13 +88,22 @@ func newUser(t *testing.T, q *storedb.Queries) (storedb.User, storedb.Device) {
 
 func activityEventItem(t *testing.T, eventID, bundleID string, startedAt, endedAt time.Time) pushItem {
 	t.Helper()
+	return activityEventItemFull(t, eventID, bundleID, startedAt, endedAt, textPtr("app_active"), false)
+}
+
+// activityEventItemFull builds an activity_event pushItem with full control
+// over `type` (nil to omit it from the wire payload, exercising the
+// optional-type default) and `deleted` (for tombstone-push tests).
+func activityEventItemFull(t *testing.T, eventID, bundleID string, startedAt, endedAt time.Time, eventType *string, deleted bool) pushItem {
+	t.Helper()
 	data, err := json.Marshal(activityEventData{
 		EventID:     eventID,
 		StartedAt:   startedAt.Format(timeLayout),
 		EndedAt:     endedAt.Format(timeLayout),
 		AppBundleID: bundleID,
 		Precision:   "exact",
-		Type:        "app_active",
+		Type:        eventType,
+		Deleted:     deleted,
 	})
 	if err != nil {
 		t.Fatalf("marshal activityEventData: %v", err)
@@ -375,5 +384,67 @@ func TestPushClockSkewSubstitutesServerTime(t *testing.T) {
 	}
 	if !storedUpdatedAt.Equal(fixedNow) {
 		t.Errorf("stored updated_at = %v, want server time %v substituted for the skewed client value", storedUpdatedAt, fixedNow)
+	}
+}
+
+// TestPushActivityEventTypeOmittedDefaultsToManual proves that an
+// activity_event item that omits `type` entirely (a doc-conformant client,
+// per documentation/sync-protocol.md's worked example) is still accepted
+// and applied, per RIZ-33 code-review fix (HIGH-3): the server defaults
+// the NOT NULL `type` column to "manual" rather than rejecting the item.
+func TestPushActivityEventTypeOmittedDefaultsToManual(t *testing.T) {
+	pool := testPool(t)
+	q := storedb.New(pool)
+	user, device := newUser(t, q)
+	svc := &Service{Queries: q}
+	ctx := context.Background()
+
+	suffix := randomSuffix(t)
+	eventID := newUUIDv7(t)
+	startedAt := time.Now().UTC().Truncate(time.Second)
+
+	resp, err := svc.push(ctx, userIDString(user), pushRequest{
+		DeviceID: device.ID.String(),
+		Items:    []pushItem{activityEventItemFull(t, eventID, "com.example.type-omitted."+suffix, startedAt, startedAt.Add(time.Minute), nil, false)},
+	})
+	if err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	if len(resp.Results) != 1 || resp.Results[0].Status != "applied" {
+		t.Fatalf("results = %+v, want a single applied result", resp.Results)
+	}
+
+	var storedType string
+	if err := pool.QueryRow(ctx, `SELECT type FROM activity_events WHERE user_id = $1 AND event_id = $2`, user.ID, mustParseUUID(t, eventID)).Scan(&storedType); err != nil {
+		t.Fatalf("select activity_events: %v", err)
+	}
+	if storedType != "manual" {
+		t.Errorf("stored type = %q, want default %q", storedType, "manual")
+	}
+}
+
+// TestPushActivityEventInvalidTypeRejected proves that an
+// explicitly-supplied `type` outside the documented enum is still rejected
+// as "invalid" (the optional-type change only relaxes omission, not the
+// enum check on a supplied value).
+func TestPushActivityEventInvalidTypeRejected(t *testing.T) {
+	q := storedb.New(testPool(t))
+	user, device := newUser(t, q)
+	svc := &Service{Queries: q}
+	ctx := context.Background()
+
+	startedAt := time.Now().UTC().Truncate(time.Second)
+	resp, err := svc.push(ctx, userIDString(user), pushRequest{
+		DeviceID: device.ID.String(),
+		Items:    []pushItem{activityEventItemFull(t, newUUIDv7(t), "com.example.type-invalid", startedAt, startedAt.Add(time.Minute), textPtr("not-a-real-type"), false)},
+	})
+	if err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	if len(resp.Results) != 1 || resp.Results[0].Status != "invalid" {
+		t.Fatalf("results = %+v, want a single invalid result", resp.Results)
+	}
+	if resp.Results[0].Error == nil || resp.Results[0].Error.Code != "VALIDATION_ERROR" {
+		t.Errorf("results[0].Error = %+v, want a VALIDATION_ERROR", resp.Results[0].Error)
 	}
 }
