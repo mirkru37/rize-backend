@@ -39,6 +39,17 @@ const (
 	// DefaultReadyzDBPingTimeout bounds how long /readyz waits on a
 	// database ping before reporting unavailable.
 	DefaultReadyzDBPingTimeout = 5 * time.Second
+
+	// DefaultReadTimeout bounds how long the server waits to read an
+	// entire request (headers and body) before aborting it, protecting
+	// against slow-client resource exhaustion.
+	DefaultReadTimeout = 10 * time.Second
+	// DefaultWriteTimeout bounds how long the server waits to write a
+	// response before aborting the connection.
+	DefaultWriteTimeout = 30 * time.Second
+	// DefaultIdleTimeout bounds how long the server keeps an idle
+	// keep-alive connection open before closing it.
+	DefaultIdleTimeout = 120 * time.Second
 )
 
 // Config holds rize-backend's runtime configuration, loaded from
@@ -46,10 +57,11 @@ const (
 type Config struct {
 	// HTTPPort is the TCP port the HTTP server listens on.
 	HTTPPort string
-	// Environment names the deployment environment, e.g. "development",
-	// "staging", "production". It is informational (used in logging and,
-	// in the future, to gate environment-specific behavior) and does not
-	// itself change config validation.
+	// Environment names the deployment environment: one of "development",
+	// "staging", or "production" (Load rejects any other value). Besides
+	// being informational (used in logging), it gates the wildcard-CORS
+	// validation below — only "development" may resolve to a wildcard
+	// CORSAllowedOrigins.
 	Environment string
 	// DatabaseURL is the PostgreSQL/TimescaleDB connection string. It may
 	// be empty in local scaffolding contexts (e.g. running the binary
@@ -74,7 +86,10 @@ type Config struct {
 	// cross-origin requests, per documentation/security.md §API hardening
 	// ("CORS is locked to known origins ... there is no wildcard (*) CORS
 	// origin in any environment"). Defaults to "*" for local development
-	// only; any deployed environment must set this explicitly.
+	// only; Load fails fast if it resolves to a wildcard in any
+	// environment other than "development" (including via the unset-var
+	// default), so a deployed environment cannot start without an
+	// explicit origin list.
 	CORSAllowedOrigins []string
 
 	// RateLimitRequestsPerMinute is the per-IP request budget enforced by
@@ -85,6 +100,16 @@ type Config struct {
 	ShutdownTimeout time.Duration
 	// ReadyzDBPingTimeout bounds the /readyz database ping.
 	ReadyzDBPingTimeout time.Duration
+
+	// ReadTimeout bounds how long the HTTP server waits to read an entire
+	// request before aborting it.
+	ReadTimeout time.Duration
+	// WriteTimeout bounds how long the HTTP server waits to write a
+	// response before aborting the connection.
+	WriteTimeout time.Duration
+	// IdleTimeout bounds how long the HTTP server keeps an idle
+	// keep-alive connection open before closing it.
+	IdleTimeout time.Duration
 }
 
 // Load builds a Config from environment variables, applying defaults for
@@ -100,6 +125,9 @@ func Load() (Config, error) {
 		RateLimitRequestsPerMinute: DefaultRateLimitRequestsPerMinute,
 		ShutdownTimeout:            DefaultShutdownTimeout,
 		ReadyzDBPingTimeout:        DefaultReadyzDBPingTimeout,
+		ReadTimeout:                DefaultReadTimeout,
+		WriteTimeout:               DefaultWriteTimeout,
+		IdleTimeout:                DefaultIdleTimeout,
 	}
 
 	if v := os.Getenv("RATE_LIMIT_REQUESTS_PER_MINUTE"); v != "" {
@@ -128,7 +156,45 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("PORT must not be empty")
 	}
 
+	if !validEnvironments[cfg.Environment] {
+		return Config{}, fmt.Errorf("invalid ENVIRONMENT %q: must be one of development, staging, production", cfg.Environment)
+	}
+
+	if cfg.Environment != DefaultEnvironment && containsWildcard(cfg.CORSAllowedOrigins) {
+		return Config{}, fmt.Errorf(
+			"CORS_ALLOWED_ORIGINS must not contain %q outside %q; per documentation/security.md §API hardening, "+
+				"CORS must be locked to known origins in any deployed environment (got environment %q)",
+			corsWildcard, DefaultEnvironment, cfg.Environment,
+		)
+	}
+
 	return cfg, nil
+}
+
+// corsWildcard is the CORS "allow every origin" value that is only
+// tolerated in the development environment; see containsWildcard's use in
+// Load.
+const corsWildcard = "*"
+
+// validEnvironments is the closed set of values ENVIRONMENT may take. Load's
+// wildcard-CORS guard below depends on knowing exactly which value means
+// "development", so an unrecognized ENVIRONMENT value is rejected outright
+// rather than silently treated as non-development (or as development).
+var validEnvironments = map[string]bool{
+	DefaultEnvironment: true,
+	"staging":          true,
+	"production":       true,
+}
+
+// containsWildcard reports whether origins contains the CORS wildcard
+// value.
+func containsWildcard(origins []string) bool {
+	for _, o := range origins {
+		if o == corsWildcard {
+			return true
+		}
+	}
+	return false
 }
 
 func getEnvDefault(key, def string) string {
