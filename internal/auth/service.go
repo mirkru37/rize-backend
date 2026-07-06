@@ -154,9 +154,18 @@ func validEmail(email string) (string, error) {
 	return addr.Address, nil
 }
 
+// maxPasswordBytes bounds accepted password length before any hashing
+// occurs, so an oversized payload can never be fed into argon2id (RIZ-32
+// M3): argon2's cost is proportional to input size, so an unbounded
+// password is a cheap way to force expensive hashing work server-side.
+const maxPasswordBytes = 1024
+
 func validPassword(password string) error {
 	if len(password) < 8 {
 		return fmt.Errorf("%w: password must be at least 8 characters", ErrValidation)
+	}
+	if len(password) > maxPasswordBytes {
+		return fmt.Errorf("%w: password must not exceed %d bytes", ErrValidation, maxPasswordBytes)
 	}
 	return nil
 }

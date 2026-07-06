@@ -6,6 +6,7 @@ import (
 	"crypto/rsa"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -384,6 +385,48 @@ func TestLoginTwiceSameDevice_ExactlyOneActiveRefreshTokenPerDevice(t *testing.T
 		if rt.DeviceID == registered.Device.ID {
 			t.Fatalf("device %v still has an active refresh token after double-login + logout: %+v", registered.Device.ID, rt)
 		}
+	}
+}
+
+// TestValidPasswordLength is table-driven coverage for RIZ-32 M3: passwords
+// longer than 1024 bytes must be rejected with ErrValidation before any
+// hashing occurs, exercised end-to-end through Register (validPassword
+// itself is unexported).
+func TestValidPasswordLength(t *testing.T) {
+	tests := []struct {
+		name      string
+		password  string
+		wantErr   bool
+		wantErrIs error
+	}{
+		{name: "too short (7 bytes)", password: strings.Repeat("a", 7), wantErr: true, wantErrIs: auth.ErrValidation},
+		{name: "minimum valid length (8 bytes)", password: strings.Repeat("a", 8), wantErr: false},
+		{name: "typical valid password", password: "correct-horse-battery-staple", wantErr: false},
+		{name: "boundary: exactly 1024 bytes", password: strings.Repeat("a", 1024), wantErr: false},
+		{name: "boundary: 1025 bytes (rejected)", password: strings.Repeat("a", 1025), wantErr: true, wantErrIs: auth.ErrValidation},
+		{name: "well over the limit (4096 bytes, rejected)", password: strings.Repeat("a", 4096), wantErr: true, wantErrIs: auth.ErrValidation},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			svc, _ := newTestService(t)
+			ctx := context.Background()
+
+			_, err := svc.Register(ctx, uniqueEmail("pwlen"), tt.password, testDevice("Password Length Test Device"))
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("Register with a %d-byte password succeeded, want an error", len(tt.password))
+				}
+				if tt.wantErrIs != nil && !errors.Is(err, tt.wantErrIs) {
+					t.Fatalf("Register error = %v, want errors.Is(err, %v)", err, tt.wantErrIs)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Register with a %d-byte password failed: %v", len(tt.password), err)
+			}
+		})
 	}
 }
 
