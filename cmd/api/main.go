@@ -20,12 +20,16 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/mirkru37/rize-backend/internal/auth"
+	"github.com/mirkru37/rize-backend/internal/categories"
 	"github.com/mirkru37/rize-backend/internal/config"
+	"github.com/mirkru37/rize-backend/internal/focussessions"
 	"github.com/mirkru37/rize-backend/internal/httpx"
 	appmw "github.com/mirkru37/rize-backend/internal/middleware"
+	"github.com/mirkru37/rize-backend/internal/projects"
 	"github.com/mirkru37/rize-backend/internal/store"
 	"github.com/mirkru37/rize-backend/internal/store/storedb"
 	"github.com/mirkru37/rize-backend/internal/sync"
+	"github.com/mirkru37/rize-backend/internal/tags"
 )
 
 func main() {
@@ -146,6 +150,18 @@ func newRouter(logger *slog.Logger, cfg config.Config, pool *pgxpool.Pool) http.
 	syncService := &sync.Service{Queries: queries}
 	syncHandler := sync.NewHandler(syncService)
 
+	projectsService := &projects.Service{Queries: queries}
+	projectsHandler := projects.NewHandler(projectsService)
+
+	tagsService := &tags.Service{Queries: queries}
+	tagsHandler := tags.NewHandler(tagsService)
+
+	categoriesService := &categories.Service{Queries: queries}
+	categoriesHandler := categories.NewHandler(categoriesService)
+
+	focusSessionsService := &focussessions.Service{Queries: queries}
+	focusSessionsHandler := focussessions.NewHandler(focusSessionsService)
+
 	r.Route("/v1", func(r chi.Router) {
 		r.Use(appmw.CORS(appmw.CORSConfig{AllowedOrigins: cfg.CORSAllowedOrigins}))
 		r.Use(appmw.RateLimit(cfg.RateLimitRequestsPerMinute))
@@ -155,9 +171,13 @@ func newRouter(logger *slog.Logger, cfg config.Config, pool *pgxpool.Pool) http.
 
 		auth.RegisterRoutes(r, authHandler, authenticate, requireAdmin)
 		sync.RegisterRoutes(r, syncHandler, authenticate)
+		projects.RegisterRoutes(r, projectsHandler, authenticate)
+		tags.RegisterRoutes(r, tagsHandler, authenticate)
+		categories.RegisterRoutes(r, categoriesHandler, authenticate)
+		focussessions.RegisterRoutes(r, focusSessionsHandler, authenticate)
 
-		// Remaining business routes (activities, reports, projects, tags,
-		// categories) are attached by future tickets.
+		// Remaining business routes (activities, reports) are attached by
+		// future tickets.
 	})
 
 	return r
