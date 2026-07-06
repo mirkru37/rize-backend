@@ -1,0 +1,103 @@
+-- name: ListActivityEventsForUser :many
+-- GET /v1/activities per documentation/api-reference.md §Activities &
+-- reports: raw tracked events for the authenticated user, filterable by
+-- time range, app, category, project, device, and precision. Scoped by
+-- user_id per documentation/security.md §Tenant Isolation. Soft-deleted
+-- (deleted = true) rows are excluded, matching the CRUD groups' convention
+-- of excluding tombstoned rows from a "current state" list.
+--
+-- Keyset-paginated on (started_at, event_id) ascending rather than the
+-- server_seq cursor other CRUD lists use: an activity-events list is
+-- naturally consumed in chronological order over an explicit time range,
+-- and started_at is the hypertable's own partitioning column, so ordering
+-- on it lets Postgres use the activity_events_user_started_idx index
+-- instead of the server_seq index. The initial page passes
+-- cursor_started_at = '-infinity' and cursor_event_id =
+-- '00000000-0000-0000-0000-000000000000' (see internal/activities'
+-- cursor.go), which sorts before every real row.
+--
+-- sqlc.narg filters: a NULL argument (an omitted query-string filter)
+-- disables that filter's predicate entirely via the "IS NULL OR" branch.
+SELECT * FROM activity_events
+WHERE user_id = $1
+  AND deleted = false
+  AND started_at >= sqlc.arg(from_ts) AND started_at < sqlc.arg(to_ts)
+  AND (sqlc.narg(app_id)::uuid IS NULL OR app_id = sqlc.narg(app_id))
+  AND (sqlc.narg(category_id)::uuid IS NULL OR category_id = sqlc.narg(category_id))
+  AND (sqlc.narg(project_id)::uuid IS NULL OR project_id = sqlc.narg(project_id))
+  AND (sqlc.narg(device_id)::uuid IS NULL OR device_id = sqlc.narg(device_id))
+  AND (sqlc.narg(precision)::text IS NULL OR precision = sqlc.narg(precision))
+  AND (started_at, event_id) > (sqlc.arg(cursor_started_at)::timestamptz, sqlc.arg(cursor_event_id)::uuid)
+ORDER BY started_at ASC, event_id ASC
+LIMIT sqlc.arg(page_limit);
+
+-- name: RawActivityEventsForReport :many
+-- The report layer's raw-event pass, per documentation/architecture-backend.md
+-- §Aggregation Strategy: used (a) always for the current/partial period,
+-- and (b) as the only path for filters (device_id, precision) or
+-- dimensions (project) the continuous aggregates cannot serve, since
+-- daily_app_totals/daily_category_totals carry no device_id or precision
+-- column and no project-dimensioned aggregate exists at all — see
+-- internal/reports' service.go doc comment for the full resolution.
+--
+-- Selects events overlapping [from_ts, to_ts) — not merely started within
+-- it — so an event that begins before the window and ends inside it (or
+-- vice versa) is still included for trimming, which clips each event to
+-- the window before merging. Joins apps/categories/projects so the report
+-- layer never needs a second round trip to resolve display names.
+SELECT
+    e.device_id,
+    e.app_id,
+    a.name AS app_name,
+    a.bundle_id AS app_bundle_id,
+    e.category_id,
+    c.name AS category_name,
+    e.project_id,
+    p.name AS project_name,
+    e.started_at,
+    e.ended_at
+FROM activity_events e
+LEFT JOIN apps a ON a.id = e.app_id
+LEFT JOIN categories c ON c.id = e.category_id
+LEFT JOIN projects p ON p.id = e.project_id
+WHERE e.user_id = $1
+  AND e.deleted = false
+  AND e.started_at < sqlc.arg(to_ts) AND e.ended_at > sqlc.arg(from_ts)
+  AND (sqlc.narg(app_id)::uuid IS NULL OR e.app_id = sqlc.narg(app_id))
+  AND (sqlc.narg(category_id)::uuid IS NULL OR e.category_id = sqlc.narg(category_id))
+  AND (sqlc.narg(project_id)::uuid IS NULL OR e.project_id = sqlc.narg(project_id))
+  AND (sqlc.narg(device_id)::uuid IS NULL OR e.device_id = sqlc.narg(device_id))
+  AND (sqlc.narg(precision)::text IS NULL OR e.precision = sqlc.narg(precision))
+ORDER BY e.device_id, e.started_at;
+
+-- name: CategoryTotalsForRange :many
+-- Closed-period fast path for reports/daily, reports/categories, and
+-- reports/summary's category breakdown: sums the daily_category_totals
+-- continuous aggregate over [from_day, to_day) per
+-- documentation/architecture-backend.md §Aggregation Strategy. Only used
+-- when the request has no device_id/precision filter (the aggregate has
+-- neither dimension) — see internal/reports/service.go.
+SELECT
+    d.category_id,
+    c.name AS category_name,
+    sum(d.total_s)::bigint AS total_s
+FROM daily_category_totals d
+LEFT JOIN categories c ON c.id = d.category_id
+WHERE d.user_id = $1 AND d.day >= sqlc.arg(from_day)::timestamptz AND d.day < sqlc.arg(to_day)::timestamptz
+GROUP BY d.category_id, c.name;
+
+-- name: AppTotalsForRange :many
+-- Closed-period fast path for reports/apps: sums the daily_app_totals
+-- continuous aggregate over [from_day, to_day) per
+-- documentation/architecture-backend.md §Aggregation Strategy. Only used
+-- when the request has no device_id/precision filter — see
+-- internal/reports/service.go.
+SELECT
+    d.app_id,
+    a.name AS app_name,
+    a.bundle_id AS app_bundle_id,
+    sum(d.total_s)::bigint AS total_s
+FROM daily_app_totals d
+LEFT JOIN apps a ON a.id = d.app_id
+WHERE d.user_id = $1 AND d.day >= sqlc.arg(from_day)::timestamptz AND d.day < sqlc.arg(to_day)::timestamptz
+GROUP BY d.app_id, a.name, a.bundle_id;

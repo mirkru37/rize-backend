@@ -249,6 +249,22 @@ func (f *fakeQuerier) ListFocusSessionsForUser(context.Context, storedb.ListFocu
 	return nil, errNotImplementedByFakeQuerier
 }
 
+func (f *fakeQuerier) ListActivityEventsForUser(context.Context, storedb.ListActivityEventsForUserParams) ([]storedb.ActivityEvent, error) {
+	return nil, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) RawActivityEventsForReport(context.Context, storedb.RawActivityEventsForReportParams) ([]storedb.RawActivityEventsForReportRow, error) {
+	return nil, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) CategoryTotalsForRange(context.Context, storedb.CategoryTotalsForRangeParams) ([]storedb.CategoryTotalsForRangeRow, error) {
+	return nil, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) AppTotalsForRange(context.Context, storedb.AppTotalsForRangeParams) ([]storedb.AppTotalsForRangeRow, error) {
+	return nil, errNotImplementedByFakeQuerier
+}
+
 func (f *fakeQuerier) ListProjectsForUser(context.Context, storedb.ListProjectsForUserParams) ([]storedb.Project, error) {
 	return nil, errNotImplementedByFakeQuerier
 }

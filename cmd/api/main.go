@@ -19,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/mirkru37/rize-backend/internal/activities"
 	"github.com/mirkru37/rize-backend/internal/auth"
 	"github.com/mirkru37/rize-backend/internal/categories"
 	"github.com/mirkru37/rize-backend/internal/config"
@@ -26,6 +27,7 @@ import (
 	"github.com/mirkru37/rize-backend/internal/httpx"
 	appmw "github.com/mirkru37/rize-backend/internal/middleware"
 	"github.com/mirkru37/rize-backend/internal/projects"
+	"github.com/mirkru37/rize-backend/internal/reports"
 	"github.com/mirkru37/rize-backend/internal/store"
 	"github.com/mirkru37/rize-backend/internal/store/storedb"
 	"github.com/mirkru37/rize-backend/internal/sync"
@@ -166,6 +168,12 @@ func newRouter(logger *slog.Logger, cfg config.Config, pool *pgxpool.Pool) http.
 	focusSessionsService := &focussessions.Service{Queries: queries}
 	focusSessionsHandler := focussessions.NewHandler(focusSessionsService)
 
+	activitiesService := &activities.Service{Queries: queries}
+	activitiesHandler := activities.NewHandler(activitiesService)
+
+	reportsService := &reports.Service{Queries: queries}
+	reportsHandler := reports.NewHandler(reportsService)
+
 	r.Route("/v1", func(r chi.Router) {
 		r.Use(appmw.CORS(appmw.CORSConfig{AllowedOrigins: cfg.CORSAllowedOrigins}))
 		r.Use(appmw.RateLimit(cfg.RateLimitRequestsPerMinute))
@@ -179,9 +187,8 @@ func newRouter(logger *slog.Logger, cfg config.Config, pool *pgxpool.Pool) http.
 		tags.RegisterRoutes(r, tagsHandler, authenticate)
 		categories.RegisterRoutes(r, categoriesHandler, authenticate)
 		focussessions.RegisterRoutes(r, focusSessionsHandler, authenticate)
-
-		// Remaining business routes (activities, reports) are attached by
-		// future tickets.
+		activities.RegisterRoutes(r, activitiesHandler, authenticate)
+		reports.RegisterRoutes(r, reportsHandler, authenticate)
 	})
 
 	return r
