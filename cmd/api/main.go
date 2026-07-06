@@ -5,7 +5,9 @@ package main
 
 import (
 	"context"
+	"crypto/rsa"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -17,10 +19,12 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/mirkru37/rize-backend/internal/auth"
 	"github.com/mirkru37/rize-backend/internal/config"
 	"github.com/mirkru37/rize-backend/internal/httpx"
 	appmw "github.com/mirkru37/rize-backend/internal/middleware"
 	"github.com/mirkru37/rize-backend/internal/store"
+	"github.com/mirkru37/rize-backend/internal/store/storedb"
 )
 
 func main() {
@@ -92,14 +96,22 @@ func run(logger *slog.Logger, cfg config.Config) error {
 
 // newRouter builds the Chi router with the middleware chain applied in the
 // exact order mandated by documentation/architecture-backend.md §Middleware
-// Stack: RequestID -> Logging -> Recoverer -> CORS -> RateLimit -> (Auth ->
-// RBAC, not implemented by this ticket). Ops endpoints (/healthz, /readyz,
-// /metrics) are unversioned and sit outside that stack's
-// CORS/rate-limit/auth concerns per documentation/api-reference.md §Ops;
-// all future business routes are mounted under /v1.
+// Stack: RequestID -> Logging -> Recoverer -> CORS -> RateLimit -> Auth ->
+// RBAC. Ops endpoints (/healthz, /readyz, /metrics) are unversioned and sit
+// outside that stack's CORS/rate-limit/auth concerns per
+// documentation/api-reference.md §Ops.
 //
 // RIZ-30 fix note: chi's RealIP middleware was removed from this stack —
 // see the package doc comment in internal/middleware/doc.go for why.
+//
+// RIZ-32: the JWT signing key drives both the Auth middleware (verification,
+// via its public half) and the auth service (issuance, via the private
+// key). If JWT_SIGNING_KEY is unset, an ephemeral key is generated for
+// "development" only (see loadOrGenerateSigningKey) so a fresh checkout can
+// exercise auth locally without extra setup; every other environment must
+// configure JWT_SIGNING_KEY explicitly and newRouter panics if it doesn't
+// parse, since a broken signing key is a fatal misconfiguration rather than
+// something the server can run degraded through.
 func newRouter(logger *slog.Logger, cfg config.Config, pool *pgxpool.Pool) http.Handler {
 	r := chi.NewRouter()
 
@@ -115,18 +127,49 @@ func newRouter(logger *slog.Logger, cfg config.Config, pool *pgxpool.Pool) http.
 	r.Get("/readyz", readyzHandler(pool, cfg.ReadyzDBPingTimeout))
 	r.Handle("/metrics", promhttp.Handler())
 
+	signingKey, err := loadOrGenerateSigningKey(cfg)
+	if err != nil {
+		logger.Error("failed to load JWT signing key", "error", err)
+		panic(err)
+	}
+
+	var queries storedb.Querier
+	if pool != nil {
+		queries = storedb.New(pool)
+	}
+	authService := &auth.Service{Queries: queries, SigningKey: signingKey}
+	authHandler := auth.NewHandler(authService)
+
 	r.Route("/v1", func(r chi.Router) {
 		r.Use(appmw.CORS(appmw.CORSConfig{AllowedOrigins: cfg.CORSAllowedOrigins}))
 		r.Use(appmw.RateLimit(cfg.RateLimitRequestsPerMinute))
 
-		// Business routes (auth, users, devices, sync, activities,
-		// reports, projects, tags, categories, focus-sessions, admin)
-		// are attached here by future tickets, once Auth/RBAC
-		// middleware exists. RIZ-30 only establishes the /v1 mount
-		// point itself.
+		authenticate := appmw.Authenticate(&signingKey.PublicKey)
+		requireAdmin := appmw.RequireRole("admin")
+
+		auth.RegisterRoutes(r, authHandler, authenticate, requireAdmin)
+
+		// Remaining business routes (sync, activities, reports, projects,
+		// tags, categories, focus-sessions) are attached by future
+		// tickets.
 	})
 
 	return r
+}
+
+// loadOrGenerateSigningKey resolves the RSA private key used to sign/verify
+// access tokens from cfg.JWTSigningKey, or generates an ephemeral one when
+// unset in the "development" environment. See config.Config.JWTSigningKey
+// and auth.LoadSigningKey/auth.GenerateSigningKey for the underlying
+// parsing/generation logic and the RS256 algorithm-pinning rationale.
+func loadOrGenerateSigningKey(cfg config.Config) (*rsa.PrivateKey, error) {
+	if cfg.JWTSigningKey != "" {
+		return auth.LoadSigningKey(cfg.JWTSigningKey)
+	}
+	if cfg.Environment != config.DefaultEnvironment {
+		return nil, fmt.Errorf("JWT_SIGNING_KEY must be set in %q", cfg.Environment)
+	}
+	return auth.GenerateSigningKey()
 }
 
 // notFoundHandler writes the standard RFC 7807-style Problem body for
