@@ -25,6 +25,7 @@ import (
 	appmw "github.com/mirkru37/rize-backend/internal/middleware"
 	"github.com/mirkru37/rize-backend/internal/store"
 	"github.com/mirkru37/rize-backend/internal/store/storedb"
+	"github.com/mirkru37/rize-backend/internal/sync"
 )
 
 func main() {
@@ -142,6 +143,9 @@ func newRouter(logger *slog.Logger, cfg config.Config, pool *pgxpool.Pool) http.
 	authService := &auth.Service{Queries: queries, Pool: beginner, SigningKey: signingKey}
 	authHandler := auth.NewHandler(authService)
 
+	syncService := &sync.Service{Queries: queries}
+	syncHandler := sync.NewHandler(syncService)
+
 	r.Route("/v1", func(r chi.Router) {
 		r.Use(appmw.CORS(appmw.CORSConfig{AllowedOrigins: cfg.CORSAllowedOrigins}))
 		r.Use(appmw.RateLimit(cfg.RateLimitRequestsPerMinute))
@@ -150,10 +154,10 @@ func newRouter(logger *slog.Logger, cfg config.Config, pool *pgxpool.Pool) http.
 		requireAdmin := appmw.RequireRole("admin")
 
 		auth.RegisterRoutes(r, authHandler, authenticate, requireAdmin)
+		sync.RegisterRoutes(r, syncHandler, authenticate)
 
-		// Remaining business routes (sync, activities, reports, projects,
-		// tags, categories, focus-sessions) are attached by future
-		// tickets.
+		// Remaining business routes (activities, reports, projects, tags,
+		// categories) are attached by future tickets.
 	})
 
 	return r
