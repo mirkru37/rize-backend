@@ -1,0 +1,72 @@
+package sync
+
+import (
+	"encoding/json"
+	"errors"
+	"net/http"
+
+	"github.com/mirkru37/rize-backend/internal/auth"
+	"github.com/mirkru37/rize-backend/internal/httpx"
+)
+
+// maxRequestBodyBytes bounds every JSON request body decoded by this
+// package's handlers, matching internal/auth's request-size hardening per
+// documentation/security.md §API hardening.
+const maxRequestBodyBytes = 1 << 20 // 1 MiB
+
+const errNS = "https://api.rize-clone.example/errors/"
+
+// Handler wires Service's business logic to chi HTTP handlers. Handlers
+// stay thin (decode, validate shape, call the service, encode) per
+// rize-backend/CLAUDE.md's layering rule.
+type Handler struct {
+	Service *Service
+}
+
+// NewHandler returns a Handler backed by service.
+func NewHandler(service *Service) *Handler {
+	return &Handler{Service: service}
+}
+
+// PushEvents handles POST /v1/sync/events, per
+// documentation/sync-protocol.md §Push and documentation/api-reference.md
+// §Sync.
+func (h *Handler) PushEvents(w http.ResponseWriter, r *http.Request) {
+	identity, ok := auth.IdentityFromContext(r.Context())
+	if !ok {
+		httpx.WriteError(w, r, http.StatusUnauthorized, errNS+"unauthenticated", "Unauthenticated", "A valid access token is required.")
+		return
+	}
+
+	var req pushRequest
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpx.WriteError(w, r, http.StatusBadRequest, errNS+"invalid-request-body", "Invalid Request Body", "The request body is missing or is not valid JSON.")
+		return
+	}
+
+	resp, err := h.Service.push(r.Context(), identity.UserID, req)
+	if err != nil {
+		writeServiceError(w, r, err)
+		return
+	}
+
+	httpx.WriteJSON(w, r, http.StatusOK, resp)
+}
+
+// writeServiceError maps a Service error to the appropriate RFC 7807-style
+// Problem response.
+func writeServiceError(w http.ResponseWriter, r *http.Request, err error) {
+	switch {
+	case errors.Is(err, ErrBatchTooLarge):
+		httpx.WriteError(w, r, http.StatusBadRequest, errNS+"batch-too-large", "Batch Too Large",
+			"A push batch must not contain more than 500 items; split the outbox into sequential batches.")
+	case errors.Is(err, ErrDeviceNotFound):
+		httpx.WriteError(w, r, http.StatusForbidden, errNS+"device-not-found", "Device Not Found",
+			"device_id does not resolve to a device owned by the authenticated user.")
+	case errors.Is(err, ErrValidation):
+		httpx.WriteError(w, r, http.StatusBadRequest, errNS+"validation-error", "Validation Error", err.Error())
+	default:
+		httpx.WriteError(w, r, http.StatusInternalServerError, errNS+"internal-error", "Internal Server Error", "An unexpected error occurred.")
+	}
+}

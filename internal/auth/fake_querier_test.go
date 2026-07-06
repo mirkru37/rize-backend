@@ -3,6 +3,7 @@ package auth_test
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -13,6 +14,10 @@ import (
 
 	"github.com/mirkru37/rize-backend/internal/store/storedb"
 )
+
+// errNotImplementedByFakeQuerier is returned by the internal/sync-only
+// Querier methods stubbed out below; no internal/auth test exercises them.
+var errNotImplementedByFakeQuerier = errors.New("fakeQuerier: not implemented (internal/sync method)")
 
 // fakeQuerier is a minimal, in-memory implementation of storedb.Querier
 // used to unit-test internal/auth's Service and HTTP handlers without a
@@ -158,6 +163,42 @@ func (f *fakeQuerier) GetRefreshTokenByHashForUpdate(ctx context.Context, tokenH
 
 func (f *fakeQuerier) GetRefreshTokenByHashForUpdateNoWait(ctx context.Context, tokenHash []byte) (storedb.RefreshToken, error) {
 	return f.GetRefreshTokenByHash(ctx, tokenHash)
+}
+
+// The internal/sync package's Querier methods below are not exercised by
+// any internal/auth test (auth's Service never calls them); they exist
+// only so *fakeQuerier continues to satisfy storedb.Querier, which is one
+// interface shared by every package that talks to storedb.
+func (f *fakeQuerier) CreateApp(context.Context, storedb.CreateAppParams) (storedb.App, error) {
+	return storedb.App{}, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) GetAppByBundleID(context.Context, storedb.GetAppByBundleIDParams) (storedb.App, error) {
+	return storedb.App{}, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) GetFocusSessionByID(context.Context, pgtype.UUID) (storedb.FocusSession, error) {
+	return storedb.FocusSession{}, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) GetProjectByIDForUser(context.Context, storedb.GetProjectByIDForUserParams) (storedb.Project, error) {
+	return storedb.Project{}, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) GetUserAppSettingByUserAndApp(context.Context, storedb.GetUserAppSettingByUserAndAppParams) (storedb.UserAppSetting, error) {
+	return storedb.UserAppSetting{}, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) InsertActivityEvent(context.Context, storedb.InsertActivityEventParams) (storedb.ActivityEvent, error) {
+	return storedb.ActivityEvent{}, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) TombstoneActivityEvent(context.Context, storedb.TombstoneActivityEventParams) (storedb.ActivityEvent, error) {
+	return storedb.ActivityEvent{}, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) UpsertFocusSession(context.Context, storedb.UpsertFocusSessionParams) (storedb.FocusSession, error) {
+	return storedb.FocusSession{}, errNotImplementedByFakeQuerier
 }
 
 func (f *fakeQuerier) GetUserByAppleUserID(_ context.Context, appleUserID *string) (storedb.User, error) {
