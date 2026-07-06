@@ -17,19 +17,32 @@ type Querier interface {
 	// database-side DEFAULT 'user' on this column only applies when the column
 	// is omitted from an INSERT's column list, which sqlc's generated,
 	// fully-columned INSERT never does.
+	//
+	// server_seq is intentionally omitted from the column list so the
+	// table-level DEFAULT nextval('server_seq_global') assigns it, keeping
+	// every syncable table's server_seq drawn from the same global sequence
+	// space per documentation/sync-protocol.md.
 	CreateUser(ctx context.Context, arg CreateUserParams) (User, error)
-	GetDeviceByID(ctx context.Context, id pgtype.UUID) (Device, error)
+	// Scoped by user_id per documentation/security.md §Tenant Isolation: every
+	// query is scoped by user_id from the access token, so a request
+	// authenticated as one user can never read another user's device row.
+	GetDeviceByID(ctx context.Context, arg GetDeviceByIDParams) (Device, error)
 	GetRefreshTokenByHash(ctx context.Context, tokenHash []byte) (RefreshToken, error)
 	GetUserByAppleUserID(ctx context.Context, appleUserID *string) (User, error)
 	GetUserByEmail(ctx context.Context, email *string) (User, error)
 	GetUserByID(ctx context.Context, id pgtype.UUID) (User, error)
 	ListActiveRefreshTokensByUser(ctx context.Context, userID pgtype.UUID) ([]RefreshToken, error)
 	ListDevicesByUser(ctx context.Context, userID pgtype.UUID) ([]Device, error)
-	RevokeDevice(ctx context.Context, id pgtype.UUID) error
+	// Scoped by user_id per documentation/security.md §Tenant Isolation.
+	RevokeDevice(ctx context.Context, arg RevokeDeviceParams) error
 	RevokeRefreshTokenFamily(ctx context.Context, familyID pgtype.UUID) error
 	RotateRefreshToken(ctx context.Context, arg RotateRefreshTokenParams) (RefreshToken, error)
-	SoftDeleteUser(ctx context.Context, arg SoftDeleteUserParams) error
-	TouchDeviceLastSeen(ctx context.Context, id pgtype.UUID) error
+	SoftDeleteUser(ctx context.Context, id pgtype.UUID) error
+	// Scoped by user_id per documentation/security.md §Tenant Isolation.
+	TouchDeviceLastSeen(ctx context.Context, arg TouchDeviceLastSeenParams) error
+	// server_seq is bumped from the same global sequence used by inserts
+	// (table DEFAULT only applies to INSERTs, so UPDATEs draw from it
+	// explicitly) per documentation/sync-protocol.md.
 	UpdateUserProfile(ctx context.Context, arg UpdateUserProfileParams) (User, error)
 }
 

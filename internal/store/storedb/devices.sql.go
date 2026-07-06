@@ -58,11 +58,19 @@ func (q *Queries) CreateDevice(ctx context.Context, arg CreateDeviceParams) (Dev
 
 const getDeviceByID = `-- name: GetDeviceByID :one
 SELECT id, user_id, platform, name, model, os_version, app_version, last_seen_at, created_at, revoked_at FROM devices
-WHERE id = $1 AND revoked_at IS NULL
+WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
 `
 
-func (q *Queries) GetDeviceByID(ctx context.Context, id pgtype.UUID) (Device, error) {
-	row := q.db.QueryRow(ctx, getDeviceByID, id)
+type GetDeviceByIDParams struct {
+	ID     pgtype.UUID `json:"id"`
+	UserID pgtype.UUID `json:"user_id"`
+}
+
+// Scoped by user_id per documentation/security.md §Tenant Isolation: every
+// query is scoped by user_id from the access token, so a request
+// authenticated as one user can never read another user's device row.
+func (q *Queries) GetDeviceByID(ctx context.Context, arg GetDeviceByIDParams) (Device, error) {
+	row := q.db.QueryRow(ctx, getDeviceByID, arg.ID, arg.UserID)
 	var i Device
 	err := row.Scan(
 		&i.ID,
@@ -119,21 +127,33 @@ func (q *Queries) ListDevicesByUser(ctx context.Context, userID pgtype.UUID) ([]
 const revokeDevice = `-- name: RevokeDevice :exec
 UPDATE devices
 SET revoked_at = now()
-WHERE id = $1 AND revoked_at IS NULL
+WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
 `
 
-func (q *Queries) RevokeDevice(ctx context.Context, id pgtype.UUID) error {
-	_, err := q.db.Exec(ctx, revokeDevice, id)
+type RevokeDeviceParams struct {
+	ID     pgtype.UUID `json:"id"`
+	UserID pgtype.UUID `json:"user_id"`
+}
+
+// Scoped by user_id per documentation/security.md §Tenant Isolation.
+func (q *Queries) RevokeDevice(ctx context.Context, arg RevokeDeviceParams) error {
+	_, err := q.db.Exec(ctx, revokeDevice, arg.ID, arg.UserID)
 	return err
 }
 
 const touchDeviceLastSeen = `-- name: TouchDeviceLastSeen :exec
 UPDATE devices
 SET last_seen_at = now()
-WHERE id = $1 AND revoked_at IS NULL
+WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
 `
 
-func (q *Queries) TouchDeviceLastSeen(ctx context.Context, id pgtype.UUID) error {
-	_, err := q.db.Exec(ctx, touchDeviceLastSeen, id)
+type TouchDeviceLastSeenParams struct {
+	ID     pgtype.UUID `json:"id"`
+	UserID pgtype.UUID `json:"user_id"`
+}
+
+// Scoped by user_id per documentation/security.md §Tenant Isolation.
+func (q *Queries) TouchDeviceLastSeen(ctx context.Context, arg TouchDeviceLastSeenParams) error {
+	_, err := q.db.Exec(ctx, touchDeviceLastSeen, arg.ID, arg.UserID)
 	return err
 }
