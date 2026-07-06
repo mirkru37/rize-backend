@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -12,7 +13,7 @@ import (
 	"github.com/mirkru37/rize-backend/internal/store/storedb"
 )
 
-// defaultPullLimit and maxPullLimit bound the per-entity-type page size
+// defaultPullLimit and maxPullLimit bound the page size
 // documentation/sync-protocol.md §Pull leaves as a caller-supplied,
 // undocumented-default `limit`. No numeric default/ceiling is specified in
 // the docs (api-reference.md's Conventions section only says "callers pass
@@ -27,33 +28,22 @@ const (
 )
 
 // pullEntityTypes lists the entity types this pull implementation
-// populates in the "changes" object, in the fixed order they're written to
-// the response.
+// populates in the "changes" object, in the fixed order documentation/
+// database-schema.md's "server_seq is present on every syncable table"
+// convention establishes, and MUST match migration 000026's set of tables
+// with a *_log_change trigger writing into sync_changelog — every
+// entity_type value ListChangelogPage can return has an entry here (see
+// resolveChangelogEntry's default case, which errors on anything else).
 //
-// documentation/sync-protocol.md's §Pull worked example's "changes" object
-// includes six keys: activity_events, focus_sessions, projects, tags,
-// user_app_settings, and aggregates. "categories" is not one of the six
-// keys shown there, YET documentation/database-schema.md's Conventions
-// section explicitly states: "server_seq is present on every syncable
-// table, including users and categories: a display-name change or a
-// custom-category edit propagates to other devices via the same
-// keyset-pagination mechanism as user_app_settings, projects, tags,
-// activity_events, and focus_sessions" — which asserts categories ARE
-// pulled the same way.
-//
-// That contradiction has since been resolved (RIZ-34 follow-up): category
-// rows ARE syncable per database-schema.md, so "categories" is included
-// below; sync-protocol.md's Entity Classes table / Pull worked example are
-// being reconciled to list it explicitly in a parallel documentation pass.
-// See ListCategoryChangesForUser's doc comment for the delivered-rows
-// scoping (system defaults + the caller's own categories).
+// "categories" is included per the RIZ-34 follow-up that reconciled
+// sync-protocol.md's Pull worked example with database-schema.md's
+// Conventions section (see ListCategoryChangesForUser's — now
+// GetCategoryForChangelogEntry's — doc comment for the delivered-rows
+// scoping: system defaults plus the caller's own categories).
 //
 // "aggregates" (server-derived rollups) is still omitted: no aggregation
 // service exists yet in this codebase (internal/reports is an empty
-// package stub) to source it from, and RIZ-34's brief scopes this ticket
-// to "sync pull + CRUD route groups," not implementing the reports/
-// aggregation epic. Computing and exposing aggregates via this endpoint is
-// out of scope here and tracked separately.
+// package stub) to source it from — out of scope for this ticket.
 var pullEntityTypes = []string{
 	"activity_events",
 	"focus_sessions",
@@ -202,165 +192,6 @@ func formatOptionalUUID(id pgtype.UUID) *string {
 	return &s
 }
 
-// pageResult is the outcome of fetching one entity type's page: the
-// upserts/tombstones to write into the response, whether more rows exist
-// beyond this page (hasMore), and lastPos, the (xid8, server_seq) tuple
-// boundary this entity type's page reached (or the incoming cursor,
-// unchanged, if this entity type had zero rows to return). See
-// migration 000025 and store.PullCursor for why the boundary is a tuple
-// rather than a bare server_seq.
-type pageResult struct {
-	upserts    []any
-	tombstones []any
-	hasMore    bool
-	lastPos    store.PullCursor
-}
-
-// pullCursorLess reports whether a is strictly before b in the tuple order
-// (xid8, server_seq) that migration 000025's keyset pagination uses.
-func pullCursorLess(a, b store.PullCursor) bool {
-	if a.Xid8 != b.Xid8 {
-		return a.Xid8 < b.Xid8
-	}
-	return a.ServerSeq < b.ServerSeq
-}
-
-// pull implements GET /v1/sync/changes for userID (from the authenticated
-// access token — never a query/body parameter, per
-// documentation/security.md §Tenant Isolation), per
-// documentation/sync-protocol.md §Pull.
-//
-// Every entity type in pullEntityTypes is queried independently for up to
-// limit+1 rows keyset-paginated by the tuple (xid8, server_seq) — NOT
-// server_seq alone, see migration 000025 and store.PullCursor — scoped to
-// userID; limit+1 lets this method detect "more rows exist beyond this
-// page" without a second round trip. The combined next_cursor is the
-// minimum (in tuple order) of the per-type boundaries among types that
-// still have more rows pending (so no row is ever skipped), or the maximum
-// boundary across all types when every type is fully drained (so the
-// cursor still advances as far as safely possible). Because pulls are
-// idempotent (documentation/sync-protocol.md: "requesting the same cursor
-// twice returns the same page, and applying that page twice is a
-// no-op"), this conservative boundary can cause a small amount of
-// redundant redelivery across page boundaries for an already-drained
-// entity type, which is explicitly safe per that guarantee — it never
-// causes a skip.
-//
-// All six per-entity-type queries run inside a single REPEATABLE READ,
-// READ ONLY transaction (see runInPullSnapshot), so every one of them sees
-// the exact same MVCC snapshot — and therefore the exact same
-// pg_snapshot_xmin/xmax horizon each query's xid8/xid_before_snapshot_horizon
-// predicates (migrations 000024/000025) gate and order on. Without a
-// shared snapshot, two queries issued as separate READ COMMITTED
-// statements could each observe a different horizon and a different
-// widened xid8 for the same physical xmin, reopening the same "advance
-// next_cursor past a row that turns out to still be uncommitted" gap this
-// fix closes. See migration 000025's comment for the full gap-free-by-
-// construction invariant that lets next_cursor safely advance only over
-// rows the horizon gate excludes, now anchored to the same tuple used for
-// ordering.
-func (s *Service) pull(ctx context.Context, userID, rawCursor string, rawLimit int) (pullResponse, error) {
-	uid, err := parseUUID(userID)
-	if err != nil {
-		return pullResponse{}, fmt.Errorf("%w: invalid authenticated user id", ErrValidation)
-	}
-
-	cursor, err := store.DecodePullCursor(rawCursor)
-	if err != nil {
-		return pullResponse{}, fmt.Errorf("%w: invalid cursor", ErrValidation)
-	}
-
-	limit := rawLimit
-	if limit <= 0 {
-		limit = defaultPullLimit
-	}
-	if limit > maxPullLimit {
-		limit = maxPullLimit
-	}
-
-	results := make(map[string]pageResult, len(pullEntityTypes))
-
-	err = s.runInPullSnapshot(ctx, func(q storedb.Querier) error {
-		aeResult, err := pullActivityEvents(ctx, q, uid, cursor, limit)
-		if err != nil {
-			return fmt.Errorf("sync: pull activity_events: %w", err)
-		}
-		results["activity_events"] = aeResult
-
-		fsResult, err := pullFocusSessions(ctx, q, uid, cursor, limit)
-		if err != nil {
-			return fmt.Errorf("sync: pull focus_sessions: %w", err)
-		}
-		results["focus_sessions"] = fsResult
-
-		prResult, err := pullProjects(ctx, q, uid, cursor, limit)
-		if err != nil {
-			return fmt.Errorf("sync: pull projects: %w", err)
-		}
-		results["projects"] = prResult
-
-		tgResult, err := pullTags(ctx, q, uid, cursor, limit)
-		if err != nil {
-			return fmt.Errorf("sync: pull tags: %w", err)
-		}
-		results["tags"] = tgResult
-
-		uasResult, err := pullUserAppSettings(ctx, q, uid, cursor, limit)
-		if err != nil {
-			return fmt.Errorf("sync: pull user_app_settings: %w", err)
-		}
-		results["user_app_settings"] = uasResult
-
-		catResult, err := pullCategories(ctx, q, uid, cursor, limit)
-		if err != nil {
-			return fmt.Errorf("sync: pull categories: %w", err)
-		}
-		results["categories"] = catResult
-
-		return nil
-	})
-	if err != nil {
-		return pullResponse{}, err
-	}
-
-	hasMore := false
-	var minPendingPos store.PullCursor
-	havePendingPos := false
-	maxPos := cursor
-	for _, r := range results {
-		if pullCursorLess(maxPos, r.lastPos) {
-			maxPos = r.lastPos
-		}
-		if r.hasMore {
-			hasMore = true
-			if !havePendingPos || pullCursorLess(r.lastPos, minPendingPos) {
-				minPendingPos = r.lastPos
-				havePendingPos = true
-			}
-		}
-	}
-
-	nextPos := maxPos
-	if hasMore {
-		nextPos = minPendingPos
-	}
-
-	changes := make(map[string]changeSet, len(pullEntityTypes))
-	for _, entityType := range pullEntityTypes {
-		r := results[entityType]
-		changes[entityType] = changeSet{
-			Upserts:    nonNilSlice(r.upserts),
-			Tombstones: nonNilSlice(r.tombstones),
-		}
-	}
-
-	return pullResponse{
-		Changes:    changes,
-		NextCursor: store.EncodePullCursor(nextPos),
-		HasMore:    hasMore,
-	}, nil
-}
-
 // nonNilSlice returns an empty (rather than nil) []any, so the JSON
 // encoding is always "[]" and never "null" for an entity type with no
 // changes in this page.
@@ -379,12 +210,15 @@ type Beginner interface {
 	BeginTx(ctx context.Context, txOptions pgx.TxOptions) (pgx.Tx, error)
 }
 
-// pullSnapshotTxOptions is the isolation level every pull's per-entity-type
-// queries share: REPEATABLE READ so all of them observe one fixed MVCC
-// snapshot (and therefore one fixed xid_before_snapshot_horizon horizon,
-// see migration 000024) instead of each being its own READ COMMITTED
-// statement with a potentially different snapshot. ReadOnly since a pull
-// never writes.
+// pullSnapshotTxOptions is the isolation level a pull's changelog-page
+// query and its per-entity resolve lookups all share: REPEATABLE READ so
+// every one of them observes one fixed MVCC snapshot (and therefore one
+// fixed xid_before_snapshot_horizon horizon, see migration 000024) instead
+// of each being its own READ COMMITTED statement with a potentially
+// different snapshot — and, just as importantly, so a resolve lookup
+// against an entity table always sees the exact same committed state the
+// changelog page it's resolving was itself read from. ReadOnly since a
+// pull never writes.
 var pullSnapshotTxOptions = pgx.TxOptions{
 	IsoLevel:   pgx.RepeatableRead,
 	AccessMode: pgx.ReadOnly,
@@ -392,8 +226,8 @@ var pullSnapshotTxOptions = pgx.TxOptions{
 
 // runInPullSnapshot runs fn with a storedb.Querier scoped to a single
 // REPEATABLE READ, READ ONLY transaction when s.Pool is configured (always
-// true in production; see cmd/api/main.go's wiring), so every per-entity-
-// type query fn issues sees the same MVCC snapshot per this file's H1 fix.
+// true in production; see cmd/api/main.go's wiring), so every query fn
+// issues sees the same MVCC snapshot per this file's H1 fix.
 //
 // When s.Pool is nil (only expected for a Service wired without a real
 // *pgxpool.Pool, e.g. a hand-built unit-test fixture that doesn't exercise
@@ -417,219 +251,369 @@ func (s *Service) runInPullSnapshot(ctx context.Context, fn func(q storedb.Queri
 	return fn(storedb.New(tx))
 }
 
-func pullActivityEvents(ctx context.Context, q storedb.Querier, uid pgtype.UUID, cursor store.PullCursor, limit int) (pageResult, error) {
-	rows, err := q.ListActivityEventChangesForUser(ctx, storedb.ListActivityEventChangesForUserParams{
-		UserID:     uid,
-		CursorXid8: pgtype.Uint64{Uint64: cursor.Xid8, Valid: true},
-		CursorSeq:  cursor.ServerSeq,
-		PageLimit:  store.LimitParam(limit + 1),
-	})
-	if err != nil {
-		return pageResult{}, err
-	}
-	hasMore := len(rows) > limit
-	if hasMore {
-		rows = rows[:limit]
-	}
-	result := pageResult{hasMore: hasMore, lastPos: cursor}
-	for _, row := range rows {
-		result.lastPos = store.PullCursor{Xid8: row.Xid8.Uint64, ServerSeq: row.ServerSeq}
-		if row.Deleted {
-			result.tombstones = append(result.tombstones, activityEventTombstoneDTO{
-				EventID:   row.EventID.String(),
-				ServerSeq: row.ServerSeq,
-			})
-			continue
-		}
-		result.upserts = append(result.upserts, activityEventUpsertDTO{
-			EventID:     row.EventID.String(),
-			StartedAt:   formatTs(row.StartedAt),
-			EndedAt:     formatTs(row.EndedAt),
-			AppBundleID: row.AppBundleID,
-			Category:    row.CategoryName,
-			Precision:   row.Precision,
-			ServerSeq:   row.ServerSeq,
-		})
-	}
-	return result, nil
+// changelogEntry is one deduplicated, resolved row destined for the
+// response: exactly one of upsert/tombstone is set (never both), matching
+// resolveChangelogEntry's contract.
+type changelogEntry struct {
+	entityType string
+	upsert     any
+	tombstone  any
 }
 
-func pullFocusSessions(ctx context.Context, q storedb.Querier, uid pgtype.UUID, cursor store.PullCursor, limit int) (pageResult, error) {
-	rows, err := q.ListFocusSessionChangesForUser(ctx, storedb.ListFocusSessionChangesForUserParams{
-		UserID:     uid,
-		CursorXid8: pgtype.Uint64{Uint64: cursor.Xid8, Valid: true},
-		CursorSeq:  cursor.ServerSeq,
-		PageLimit:  store.LimitParam(limit + 1),
+// pull implements GET /v1/sync/changes for userID (from the authenticated
+// access token — never a query/body parameter, per
+// documentation/security.md §Tenant Isolation), per
+// documentation/sync-protocol.md §Pull.
+//
+// RIZ-34 (pivot): unlike the prior design, which paginated each of the six
+// syncable tables independently and directly by
+// (xmin_xid8(that table's own xmin), server_seq) — fatal for
+// activity_events, a compressed TimescaleDB hypertable that rejects any
+// xmin reference against a compressed chunk (migration 000024/000025's
+// approach broke permanently the first time a chunk crossed the 30-day
+// compression policy) — this implementation paginates a SINGLE feed,
+// sync_changelog (migration 000026): one append-only, never-hypertable,
+// never-compressed outbox row per write to any of the six syncable tables,
+// appended by a same-transaction trigger so the changelog row's own xmin
+// (not the entity table's) carries the commit-ordering property the pull
+// cursor depends on.
+//
+// One query (ListChangelogPage) fetches up to limit+1 raw changelog rows
+// keyset-paginated by (xid8, server_seq) scoped to userID (or NULL, for
+// system-category rows); limit+1 lets this method detect "more rows exist
+// beyond this page" without a second round trip. next_cursor is simply the
+// last raw changelog row's (xid8, server_seq) tuple BEFORE dedup — i.e. the
+// literal boundary of what ListChangelogPage returned — so a re-pull at
+// that exact cursor can never re-scan a changelog row already consumed,
+// and (per migration 000025's gap-free-by-construction invariant, which
+// applies identically here since it only depends on the tuple being
+// unique and monotonic in commit order) can never skip one either. This
+// also removes the prior design's per-entity-type
+// min-pending/max-delivered aggregation entirely: there is exactly one
+// feed and one cursor now.
+//
+// Multiple changelog rows can name the same entity within one page (e.g.
+// an activity_event created then tombstoned, or a project updated twice)
+// — this method dedupes by (entity_type, entity_id), keeping only the
+// LATEST occurrence in page order, then resolves each surviving entity
+// exactly once to its CURRENT state via a point lookup (GetProjectFor-
+// ChangelogEntry and friends) rather than replaying the stale intermediate
+// row the changelog entry itself carries no payload for. A resolve lookup
+// that finds zero rows (the entity vanished entirely) is skipped rather
+// than erroring: this codebase has no hard-delete path for any syncable
+// table today (deletes are soft, via deleted_at/deleted, which a resolve
+// lookup finds and reports as a tombstone, not zero rows), so an
+// unresolvable entity_id can only mean a future, currently nonexistent
+// hard-delete path — silently omitting it from this page is safe because
+// the client's local state for that id is simply never updated again,
+// which is the same externally-observable outcome a hard delete without
+// any tombstone semantics would produce anyway.
+//
+// Every query (the changelog page and every per-entity resolve lookup)
+// runs inside a single REPEATABLE READ, READ ONLY transaction (see
+// runInPullSnapshot), so they all see the exact same MVCC snapshot.
+func (s *Service) pull(ctx context.Context, userID, rawCursor string, rawLimit int) (pullResponse, error) {
+	uid, err := parseUUID(userID)
+	if err != nil {
+		return pullResponse{}, fmt.Errorf("%w: invalid authenticated user id", ErrValidation)
+	}
+
+	cursor, err := store.DecodePullCursor(rawCursor)
+	if err != nil {
+		return pullResponse{}, fmt.Errorf("%w: invalid cursor", ErrValidation)
+	}
+
+	limit := rawLimit
+	if limit <= 0 {
+		limit = defaultPullLimit
+	}
+	if limit > maxPullLimit {
+		limit = maxPullLimit
+	}
+
+	var (
+		hasMore bool
+		nextPos = cursor
+		ordered []string
+		byKey   = map[string]changelogEntry{}
+	)
+
+	err = s.runInPullSnapshot(ctx, func(q storedb.Querier) error {
+		rows, err := q.ListChangelogPage(ctx, storedb.ListChangelogPageParams{
+			UserID:     uid,
+			CursorXid8: pgtype.Uint64{Uint64: cursor.Xid8, Valid: true},
+			CursorSeq:  cursor.ServerSeq,
+			PageLimit:  store.LimitParam(limit + 1),
+		})
+		if err != nil {
+			return fmt.Errorf("sync: list changelog page: %w", err)
+		}
+
+		hasMore = len(rows) > limit
+		if hasMore {
+			rows = rows[:limit]
+		}
+		if len(rows) > 0 {
+			last := rows[len(rows)-1]
+			nextPos = store.PullCursor{Xid8: last.Xid8.Uint64, ServerSeq: last.ServerSeq}
+		}
+
+		// Dedupe by (entity_type, entity_id), keeping the latest occurrence
+		// (rows are already in ascending (xid8, server_seq) order, so a
+		// later loop iteration always overwrites an earlier one for the
+		// same key) while preserving first-seen order for a deterministic
+		// response.
+		for _, row := range rows {
+			key := row.EntityType + ":" + row.EntityID.String()
+			if _, seen := byKey[key]; !seen {
+				ordered = append(ordered, key)
+			}
+			resolved, found, err := resolveChangelogEntry(ctx, q, uid, row)
+			if err != nil {
+				return fmt.Errorf("sync: resolve changelog entry (%s %s): %w", row.EntityType, row.EntityID.String(), err)
+			}
+			if !found {
+				// See this method's doc comment: the entity vanished
+				// entirely (no hard-delete path exists today, so this is
+				// not expected in steady state, but is safe to skip).
+				delete(byKey, key)
+				continue
+			}
+			byKey[key] = resolved
+		}
+		return nil
 	})
 	if err != nil {
-		return pageResult{}, err
+		return pullResponse{}, err
 	}
-	hasMore := len(rows) > limit
-	if hasMore {
-		rows = rows[:limit]
-	}
-	result := pageResult{hasMore: hasMore, lastPos: cursor}
-	for _, row := range rows {
-		result.lastPos = store.PullCursor{Xid8: row.Xid8.Uint64, ServerSeq: row.ServerSeq}
-		if row.DeletedAt.Valid {
-			result.tombstones = append(result.tombstones, focusSessionTombstoneDTO{
-				ID:        row.ID.String(),
-				ServerSeq: row.ServerSeq,
-			})
+
+	changes := make(map[string]changeSet, len(pullEntityTypes))
+	upserts := make(map[string][]any, len(pullEntityTypes))
+	tombstones := make(map[string][]any, len(pullEntityTypes))
+	for _, key := range ordered {
+		entry, ok := byKey[key]
+		if !ok {
+			// Deleted from byKey above (resolve found zero rows).
 			continue
 		}
-		result.upserts = append(result.upserts, focusSessionUpsertDTO{
-			ID:               row.ID.String(),
-			UpdatedAt:        formatTs(row.UpdatedAt),
-			StartedAt:        formatTs(row.StartedAt),
-			EndedAt:          formatOptionalTs(row.EndedAt),
-			ProjectID:        formatOptionalUUID(row.ProjectID),
-			Kind:             row.Kind,
-			Status:           row.Status,
-			PlannedDurationS: row.PlannedDurationS,
-			Note:             row.Note,
-			ServerSeq:        row.ServerSeq,
-		})
-	}
-	return result, nil
-}
-
-func pullProjects(ctx context.Context, q storedb.Querier, uid pgtype.UUID, cursor store.PullCursor, limit int) (pageResult, error) {
-	rows, err := q.ListProjectChangesForUser(ctx, storedb.ListProjectChangesForUserParams{
-		UserID:     uid,
-		CursorXid8: pgtype.Uint64{Uint64: cursor.Xid8, Valid: true},
-		CursorSeq:  cursor.ServerSeq,
-		PageLimit:  store.LimitParam(limit + 1),
-	})
-	if err != nil {
-		return pageResult{}, err
-	}
-	hasMore := len(rows) > limit
-	if hasMore {
-		rows = rows[:limit]
-	}
-	result := pageResult{hasMore: hasMore, lastPos: cursor}
-	for _, row := range rows {
-		result.lastPos = store.PullCursor{Xid8: row.Xid8.Uint64, ServerSeq: row.ServerSeq}
-		if row.DeletedAt.Valid {
-			result.tombstones = append(result.tombstones, projectTombstoneDTO{
-				ID:        row.ID.String(),
-				ServerSeq: row.ServerSeq,
-			})
+		if entry.tombstone != nil {
+			tombstones[entry.entityType] = append(tombstones[entry.entityType], entry.tombstone)
 			continue
 		}
-		result.upserts = append(result.upserts, projectUpsertDTO{
-			ID:         row.ID.String(),
-			Name:       row.Name,
-			Color:      row.Color,
-			ArchivedAt: formatOptionalTs(row.ArchivedAt),
-			UpdatedAt:  formatTs(row.UpdatedAt),
-			ServerSeq:  row.ServerSeq,
-		})
+		upserts[entry.entityType] = append(upserts[entry.entityType], entry.upsert)
 	}
-	return result, nil
-}
-
-func pullTags(ctx context.Context, q storedb.Querier, uid pgtype.UUID, cursor store.PullCursor, limit int) (pageResult, error) {
-	rows, err := q.ListTagChangesForUser(ctx, storedb.ListTagChangesForUserParams{
-		UserID:     uid,
-		CursorXid8: pgtype.Uint64{Uint64: cursor.Xid8, Valid: true},
-		CursorSeq:  cursor.ServerSeq,
-		PageLimit:  store.LimitParam(limit + 1),
-	})
-	if err != nil {
-		return pageResult{}, err
-	}
-	hasMore := len(rows) > limit
-	if hasMore {
-		rows = rows[:limit]
-	}
-	result := pageResult{hasMore: hasMore, lastPos: cursor}
-	for _, row := range rows {
-		result.lastPos = store.PullCursor{Xid8: row.Xid8.Uint64, ServerSeq: row.ServerSeq}
-		if row.DeletedAt.Valid {
-			result.tombstones = append(result.tombstones, tagTombstoneDTO{
-				ID:        row.ID.String(),
-				ServerSeq: row.ServerSeq,
-			})
-			continue
+	for _, entityType := range pullEntityTypes {
+		changes[entityType] = changeSet{
+			Upserts:    nonNilSlice(upserts[entityType]),
+			Tombstones: nonNilSlice(tombstones[entityType]),
 		}
-		result.upserts = append(result.upserts, tagUpsertDTO{
-			ID:        row.ID.String(),
-			Name:      row.Name,
-			UpdatedAt: formatTs(row.UpdatedAt),
-			ServerSeq: row.ServerSeq,
-		})
 	}
-	return result, nil
+
+	return pullResponse{
+		Changes:    changes,
+		NextCursor: store.EncodePullCursor(nextPos),
+		HasMore:    hasMore,
+	}, nil
 }
 
-func pullUserAppSettings(ctx context.Context, q storedb.Querier, uid pgtype.UUID, cursor store.PullCursor, limit int) (pageResult, error) {
-	rows, err := q.ListUserAppSettingChangesForUser(ctx, storedb.ListUserAppSettingChangesForUserParams{
-		UserID:     uid,
-		CursorXid8: pgtype.Uint64{Uint64: cursor.Xid8, Valid: true},
-		CursorSeq:  cursor.ServerSeq,
-		PageLimit:  store.LimitParam(limit + 1),
-	})
-	if err != nil {
-		return pageResult{}, err
-	}
-	hasMore := len(rows) > limit
-	if hasMore {
-		rows = rows[:limit]
-	}
-	result := pageResult{hasMore: hasMore, lastPos: cursor}
-	for _, row := range rows {
-		result.lastPos = store.PullCursor{Xid8: row.Xid8.Uint64, ServerSeq: row.ServerSeq}
-		// No tombstone path: user_app_settings has no deleted_at/deleted
-		// column (see documentation/database-schema.md), so every row here
-		// is an upsert.
-		result.upserts = append(result.upserts, userAppSettingUpsertDTO{
-			AppID:      row.AppID.String(),
-			CategoryID: formatOptionalUUID(row.CategoryID),
-			Excluded:   row.Excluded,
-			UpdatedAt:  formatTs(row.UpdatedAt),
-			ServerSeq:  row.ServerSeq,
+// resolveChangelogEntry resolves one sync_changelog row to its entity's
+// CURRENT state (an upsert or a tombstone), per pull's doc comment. found
+// is false when the point lookup returns zero rows (see pull's doc comment
+// for why that's safe to treat as "omit this entity from the page").
+func resolveChangelogEntry(ctx context.Context, q storedb.Querier, uid pgtype.UUID, row storedb.ListChangelogPageRow) (changelogEntry, bool, error) {
+	switch row.EntityType {
+	case "activity_events":
+		r, err := q.GetActivityEventForChangelogEntry(ctx, storedb.GetActivityEventForChangelogEntryParams{
+			UserID:    uid,
+			EventID:   row.EntityID,
+			StartedAt: row.EventStartedAt,
 		})
-	}
-	return result, nil
-}
-
-// pullCategories delivers ListCategoryChangesForUser's page (see that
-// query's doc comment for the delivered-rows scoping — system defaults
-// plus the caller's own categories).
-func pullCategories(ctx context.Context, q storedb.Querier, uid pgtype.UUID, cursor store.PullCursor, limit int) (pageResult, error) {
-	rows, err := q.ListCategoryChangesForUser(ctx, storedb.ListCategoryChangesForUserParams{
-		UserID:     uid,
-		CursorXid8: pgtype.Uint64{Uint64: cursor.Xid8, Valid: true},
-		CursorSeq:  cursor.ServerSeq,
-		PageLimit:  store.LimitParam(limit + 1),
-	})
-	if err != nil {
-		return pageResult{}, err
-	}
-	hasMore := len(rows) > limit
-	if hasMore {
-		rows = rows[:limit]
-	}
-	result := pageResult{hasMore: hasMore, lastPos: cursor}
-	for _, row := range rows {
-		result.lastPos = store.PullCursor{Xid8: row.Xid8.Uint64, ServerSeq: row.ServerSeq}
-		if row.DeletedAt.Valid {
-			result.tombstones = append(result.tombstones, categoryTombstoneDTO{
-				ID:        row.ID.String(),
-				ServerSeq: row.ServerSeq,
-			})
-			continue
+		if errors.Is(err, pgx.ErrNoRows) {
+			return changelogEntry{}, false, nil
 		}
-		result.upserts = append(result.upserts, categoryUpsertDTO{
-			ID:           row.ID.String(),
-			Name:         row.Name,
-			Color:        row.Color,
-			Productivity: row.Productivity,
-			UpdatedAt:    formatTs(row.UpdatedAt),
-			ServerSeq:    row.ServerSeq,
+		if err != nil {
+			return changelogEntry{}, false, err
+		}
+		if r.Deleted {
+			return changelogEntry{
+				entityType: row.EntityType,
+				tombstone: activityEventTombstoneDTO{
+					EventID:   r.EventID.String(),
+					ServerSeq: r.ServerSeq,
+				},
+			}, true, nil
+		}
+		return changelogEntry{
+			entityType: row.EntityType,
+			upsert: activityEventUpsertDTO{
+				EventID:     r.EventID.String(),
+				StartedAt:   formatTs(r.StartedAt),
+				EndedAt:     formatTs(r.EndedAt),
+				AppBundleID: r.AppBundleID,
+				Category:    r.CategoryName,
+				Precision:   r.Precision,
+				ServerSeq:   r.ServerSeq,
+			},
+		}, true, nil
+
+	case "focus_sessions":
+		r, err := q.GetFocusSessionForChangelogEntry(ctx, storedb.GetFocusSessionForChangelogEntryParams{
+			UserID: uid,
+			ID:     row.EntityID,
 		})
+		if errors.Is(err, pgx.ErrNoRows) {
+			return changelogEntry{}, false, nil
+		}
+		if err != nil {
+			return changelogEntry{}, false, err
+		}
+		if r.DeletedAt.Valid {
+			return changelogEntry{
+				entityType: row.EntityType,
+				tombstone: focusSessionTombstoneDTO{
+					ID:        r.ID.String(),
+					ServerSeq: r.ServerSeq,
+				},
+			}, true, nil
+		}
+		return changelogEntry{
+			entityType: row.EntityType,
+			upsert: focusSessionUpsertDTO{
+				ID:               r.ID.String(),
+				UpdatedAt:        formatTs(r.UpdatedAt),
+				StartedAt:        formatTs(r.StartedAt),
+				EndedAt:          formatOptionalTs(r.EndedAt),
+				ProjectID:        formatOptionalUUID(r.ProjectID),
+				Kind:             r.Kind,
+				Status:           r.Status,
+				PlannedDurationS: r.PlannedDurationS,
+				Note:             r.Note,
+				ServerSeq:        r.ServerSeq,
+			},
+		}, true, nil
+
+	case "projects":
+		r, err := q.GetProjectForChangelogEntry(ctx, storedb.GetProjectForChangelogEntryParams{
+			UserID: uid,
+			ID:     row.EntityID,
+		})
+		if errors.Is(err, pgx.ErrNoRows) {
+			return changelogEntry{}, false, nil
+		}
+		if err != nil {
+			return changelogEntry{}, false, err
+		}
+		if r.DeletedAt.Valid {
+			return changelogEntry{
+				entityType: row.EntityType,
+				tombstone: projectTombstoneDTO{
+					ID:        r.ID.String(),
+					ServerSeq: r.ServerSeq,
+				},
+			}, true, nil
+		}
+		return changelogEntry{
+			entityType: row.EntityType,
+			upsert: projectUpsertDTO{
+				ID:         r.ID.String(),
+				Name:       r.Name,
+				Color:      r.Color,
+				ArchivedAt: formatOptionalTs(r.ArchivedAt),
+				UpdatedAt:  formatTs(r.UpdatedAt),
+				ServerSeq:  r.ServerSeq,
+			},
+		}, true, nil
+
+	case "tags":
+		r, err := q.GetTagForChangelogEntry(ctx, storedb.GetTagForChangelogEntryParams{
+			UserID: uid,
+			ID:     row.EntityID,
+		})
+		if errors.Is(err, pgx.ErrNoRows) {
+			return changelogEntry{}, false, nil
+		}
+		if err != nil {
+			return changelogEntry{}, false, err
+		}
+		if r.DeletedAt.Valid {
+			return changelogEntry{
+				entityType: row.EntityType,
+				tombstone: tagTombstoneDTO{
+					ID:        r.ID.String(),
+					ServerSeq: r.ServerSeq,
+				},
+			}, true, nil
+		}
+		return changelogEntry{
+			entityType: row.EntityType,
+			upsert: tagUpsertDTO{
+				ID:        r.ID.String(),
+				Name:      r.Name,
+				UpdatedAt: formatTs(r.UpdatedAt),
+				ServerSeq: r.ServerSeq,
+			},
+		}, true, nil
+
+	case "user_app_settings":
+		// entity_id on the changelog row is app_id (see migration 000026's
+		// comment); no tombstone path (no deleted_at/deleted column).
+		r, err := q.GetUserAppSettingForChangelogEntry(ctx, storedb.GetUserAppSettingForChangelogEntryParams{
+			UserID: uid,
+			AppID:  row.EntityID,
+		})
+		if errors.Is(err, pgx.ErrNoRows) {
+			return changelogEntry{}, false, nil
+		}
+		if err != nil {
+			return changelogEntry{}, false, err
+		}
+		return changelogEntry{
+			entityType: row.EntityType,
+			upsert: userAppSettingUpsertDTO{
+				AppID:      r.AppID.String(),
+				CategoryID: formatOptionalUUID(r.CategoryID),
+				Excluded:   r.Excluded,
+				UpdatedAt:  formatTs(r.UpdatedAt),
+				ServerSeq:  r.ServerSeq,
+			},
+		}, true, nil
+
+	case "categories":
+		r, err := q.GetCategoryForChangelogEntry(ctx, storedb.GetCategoryForChangelogEntryParams{
+			ID:     row.EntityID,
+			UserID: uid,
+		})
+		if errors.Is(err, pgx.ErrNoRows) {
+			return changelogEntry{}, false, nil
+		}
+		if err != nil {
+			return changelogEntry{}, false, err
+		}
+		if r.DeletedAt.Valid {
+			return changelogEntry{
+				entityType: row.EntityType,
+				tombstone: categoryTombstoneDTO{
+					ID:        r.ID.String(),
+					ServerSeq: r.ServerSeq,
+				},
+			}, true, nil
+		}
+		return changelogEntry{
+			entityType: row.EntityType,
+			upsert: categoryUpsertDTO{
+				ID:           r.ID.String(),
+				Name:         r.Name,
+				Color:        r.Color,
+				Productivity: r.Productivity,
+				UpdatedAt:    formatTs(r.UpdatedAt),
+				ServerSeq:    r.ServerSeq,
+			},
+		}, true, nil
+
+	default:
+		// Should never happen: every entity_type value sync_changelog can
+		// contain comes from one of migration 000026's six *_log_change
+		// triggers, all listed in pullEntityTypes above.
+		return changelogEntry{}, false, fmt.Errorf("sync: unknown changelog entity_type %q", row.EntityType)
 	}
-	return result, nil
 }

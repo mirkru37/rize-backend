@@ -144,6 +144,16 @@ type SessionTag struct {
 	TagID    pgtype.UUID `json:"tag_id"`
 }
 
+// RIZ-34 (pivot): append-only sync outbox. One row per write to a syncable table (activity_events, focus_sessions, projects, tags, user_app_settings, categories), appended by a same-transaction AFTER trigger so this table's own xmin -- never a compressed hypertable's -- carries the commit-ordering property GET /v1/sync/changes's pull cursor depends on. See this migration's header comment for the full rationale and the compression bug it fixes.
+type SyncChangelog struct {
+	ChangelogID    int64              `json:"changelog_id"`
+	UserID         pgtype.UUID        `json:"user_id"`
+	EntityType     string             `json:"entity_type"`
+	EntityID       pgtype.UUID        `json:"entity_id"`
+	EventStartedAt pgtype.Timestamptz `json:"event_started_at"`
+	ServerSeq      int64              `json:"server_seq"`
+}
+
 type SyncCursor struct {
 	DeviceID    pgtype.UUID        `json:"device_id"`
 	LastPullSeq int64              `json:"last_pull_seq"`

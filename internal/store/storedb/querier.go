@@ -63,11 +63,31 @@ type Querier interface {
 	// keeping every syncable table's server_seq drawn from the same global
 	// sequence space per documentation/sync-protocol.md.
 	CreateUser(ctx context.Context, arg CreateUserParams) (User, error)
+	// Resolves a sync_changelog 'activity_events' entry to the entity's current
+	// state, per internal/sync/pull.go's per-page dedupe-then-resolve step.
+	// Binds started_at (the hypertable's partitioning column, carried on the
+	// changelog row precisely so this lookup can supply it) in addition to
+	// user_id/event_id: ordinary (non-system-column) reads against a
+	// compressed chunk are fully supported by TimescaleDB -- only a bare
+	// system-column reference (this query has none) is restricted -- so this
+	// lookup succeeds unconditionally, including against a compressed chunk,
+	// which is the entire point of this migration's pivot away from querying
+	// activity_events.xmin directly. Zero rows is possible (see pull.go's doc
+	// comment on why that's safe to skip) but not expected in steady state:
+	// activity_events rows are never hard-deleted.
+	GetActivityEventForChangelogEntry(ctx context.Context, arg GetActivityEventForChangelogEntryParams) (GetActivityEventForChangelogEntryRow, error)
 	// Looks up the global app-catalog row for a (bundle_id, platform) pair, per
 	// documentation/database-schema.md's `UNIQUE (bundle_id, platform)` on
 	// `apps`. Not user-scoped: the catalog is global/cross-user by design (see
 	// documentation/architecture-backend.md §Ingestion Pipeline, stage 2).
 	GetAppByBundleID(ctx context.Context, arg GetAppByBundleIDParams) (App, error)
+	// Resolves a sync_changelog 'categories' entry to the entity's current
+	// state. `(user_id = $2 OR user_id IS NULL)` mirrors the old
+	// ListCategoryChangesForUser's scoping: a category row's own user_id
+	// always matches the changelog row's user_id that produced the entry
+	// (both NULL for a system default, both set to the same owner otherwise),
+	// so this is a tenant-safe point lookup, not a broadening of scope.
+	GetCategoryForChangelogEntry(ctx context.Context, arg GetCategoryForChangelogEntryParams) (GetCategoryForChangelogEntryRow, error)
 	// GET /v1/categories/{id}: readable if it's a system default or the
 	// caller's own, per database-schema.md's categories.user_id semantics.
 	GetCategoryForUser(ctx context.Context, arg GetCategoryForUserParams) (Category, error)
@@ -81,6 +101,10 @@ type Querier interface {
 	// violation, reported as "invalid") from a same-user last-write-wins loss
 	// (reported as "duplicate") — see internal/sync's push service.
 	GetFocusSessionByID(ctx context.Context, id pgtype.UUID) (FocusSession, error)
+	// Resolves a sync_changelog 'focus_sessions' entry to the entity's current
+	// state. See GetActivityEventForChangelogEntry's doc comment for the
+	// resolve-step rationale.
+	GetFocusSessionForChangelogEntry(ctx context.Context, arg GetFocusSessionForChangelogEntryParams) (GetFocusSessionForChangelogEntryRow, error)
 	// Tenant-scoped lookup for GET /v1/focus-sessions/{id} and as the
 	// authorization check before PATCH/DELETE. Zero rows for either "no such
 	// session" or "belongs to another user," reported identically as 404.
@@ -102,6 +126,10 @@ type Querier interface {
 	// so the caller cannot distinguish "doesn't exist" from "not yours" and
 	// leak the other tenant's project existence.
 	GetProjectByIDForUser(ctx context.Context, arg GetProjectByIDForUserParams) (Project, error)
+	// Resolves a sync_changelog 'projects' entry to the entity's current state.
+	// See GetActivityEventForChangelogEntry's doc comment for the
+	// resolve-step rationale.
+	GetProjectForChangelogEntry(ctx context.Context, arg GetProjectForChangelogEntryParams) (GetProjectForChangelogEntryRow, error)
 	// Tenant-scoped lookup for GET /v1/projects/{id}, and the authorization
 	// check before PATCH/DELETE. Unlike sync.sql's GetProjectByIDForUser (used
 	// by the push path to validate a focus_session's project_id reference,
@@ -123,6 +151,10 @@ type Querier interface {
 	// this exact token" from "I am the only one looking at this row right now",
 	// per documentation/security.md's refresh-rotation flow (RIZ-32 M2).
 	GetRefreshTokenByHashForUpdateNoWait(ctx context.Context, tokenHash []byte) (RefreshToken, error)
+	// Resolves a sync_changelog 'tags' entry to the entity's current state. See
+	// GetActivityEventForChangelogEntry's doc comment for the resolve-step
+	// rationale.
+	GetTagForChangelogEntry(ctx context.Context, arg GetTagForChangelogEntryParams) (GetTagForChangelogEntryRow, error)
 	// Tenant-scoped lookup for GET /v1/tags/{id}. Zero rows for either "no
 	// such tag" or "belongs to another user," per
 	// documentation/security.md §Tenant Isolation, so the two cases are
@@ -133,6 +165,13 @@ type Querier interface {
 	// Pipeline stage 3. Scoped by user_id per documentation/security.md
 	// §Tenant Isolation.
 	GetUserAppSettingByUserAndApp(ctx context.Context, arg GetUserAppSettingByUserAndAppParams) (UserAppSetting, error)
+	// Resolves a sync_changelog 'user_app_settings' entry to the entity's
+	// current state. entity_id on the changelog row is app_id (this table's
+	// primary key is the composite (user_id, app_id); user_id is already the
+	// changelog row's own user_id column, per migration 000026's comment). No
+	// tombstone path: user_app_settings has no deleted_at/deleted column (see
+	// documentation/database-schema.md), so every resolved row is an upsert.
+	GetUserAppSettingForChangelogEntry(ctx context.Context, arg GetUserAppSettingForChangelogEntryParams) (UserAppSetting, error)
 	GetUserByAppleUserID(ctx context.Context, appleUserID *string) (User, error)
 	GetUserByEmail(ctx context.Context, email *string) (User, error)
 	GetUserByID(ctx context.Context, id pgtype.UUID) (User, error)
@@ -146,43 +185,6 @@ type Querier interface {
 	// request body) per documentation/security.md §Tenant Isolation.
 	InsertActivityEvent(ctx context.Context, arg InsertActivityEventParams) (ActivityEvent, error)
 	ListActiveRefreshTokensByUser(ctx context.Context, userID pgtype.UUID) ([]RefreshToken, error)
-	// One page of GET /v1/sync/changes's "activity_events" entity, per
-	// documentation/sync-protocol.md §Pull. Scoped by user_id per
-	// documentation/security.md §Tenant Isolation.
-	//
-	// Pagination/ordering key (RIZ-34 H1 re-review fix, migration 000025): the
-	// tuple (xmin_xid8(xmin), server_seq), NOT server_seq alone. server_seq
-	// (migration 000021/000022's nextval()-assigned counter) and xid
-	// assignment are independent, so a transaction can be handed a LOWER
-	// server_seq than one that later commits with a HIGHER xid — a
-	// server_seq-only cursor can then advance past a row that is still
-	// in-flight and permanently skip it once it finally commits. Anchoring the
-	// keyset to the SAME xid8 the horizon gate below already uses makes the
-	// settled (xid8 < horizon) prefix append-only under (xid8, server_seq)
-	// order, so keyset pagination over it is gap-free by construction
-	// regardless of server_seq's assignment order. See migration 000025's
-	// comment for the full invariant.
-	//
-	// xmin_xid8(ae.xmin) < pg_snapshot_xmin(pg_current_snapshot()) is the
-	// horizon gate itself (equivalent to xid_before_snapshot_horizon, inlined
-	// here so this file's ORDER BY/predicate both reference the same
-	// xmin_xid8 value): only rows whose inserting/updating transaction is
-	// fully, permanently committed as of this pull's MVCC snapshot are
-	// delivered. cursor_xid8/cursor_seq are the caller's opaque cursor's decoded
-	// (xid8, server_seq) tuple (the zero cursor, (0, 0), means "from the
-	// beginning" since real xids/server_seqs are always > 0); page_limit is the
-	// caller-requested page size PLUS ONE (see internal/sync's pull service),
-	// so the caller can detect "more rows exist beyond this page" without a
-	// second round trip. app_bundle_id and category_name are resolved via LEFT
-	// JOIN so a null app_id/category_id (never yet resolved) doesn't drop the
-	// row, matching documentation/sync-protocol.md's upsert shape
-	// ({"app_bundle_id": ..., "category": ...}).
-	//
-	// This query MUST run inside the same REPEATABLE READ transaction as every
-	// other pull query in the same request (internal/sync's pull service opens
-	// it), so pg_current_snapshot() resolves to one stable snapshot across all
-	// of them.
-	ListActivityEventChangesForUser(ctx context.Context, arg ListActivityEventChangesForUserParams) ([]ListActivityEventChangesForUserRow, error)
 	// GET /v1/categories per documentation/api-reference.md §CRUD groups.
 	// documentation/database-schema.md's categories table: "user_id IS NULL
 	// denotes a system default category available to every user; user_id set
@@ -190,32 +192,47 @@ type Querier interface {
 	// union of every system default plus their own custom categories,
 	// keyset-paginated together by server_seq.
 	ListCategoriesForUser(ctx context.Context, arg ListCategoriesForUserParams) ([]Category, error)
-	// One page of GET /v1/sync/changes's "categories" entity (RIZ-34 M1).
-	// database-schema.md states server_seq-based keyset pagination applies to
-	// categories exactly like every other syncable table (now over the
-	// (xid8, server_seq) tuple, see ListActivityEventChangesForUser's doc
-	// comment); scoping mirrors internal/store/queries/categories.sql's
-	// ListCategoriesForUser: a user's pull sees the union of every system
-	// default category (user_id IS NULL) plus their own custom categories
-	// (user_id = $1), so a client can resolve every category_id it might see
-	// on an activity_event/user_app_setting row. See
-	// ListActivityEventChangesForUser's doc comment for the pagination and
-	// xmin-horizon rationale.
-	ListCategoryChangesForUser(ctx context.Context, arg ListCategoryChangesForUserParams) ([]ListCategoryChangesForUserRow, error)
+	// One page of GET /v1/sync/changes's raw change feed, per
+	// documentation/sync-protocol.md §Pull. RIZ-34 (pivot): this single query
+	// replaces the six separate per-entity-table pagination queries this file
+	// used to define (ListActivityEventChangesForUser and friends), which
+	// paginated each syncable table directly by its own
+	// (xmin_xid8(xmin), server_seq) tuple -- fatal for activity_events, a
+	// compressed hypertable that rejects any xmin reference on a compressed
+	// chunk. See migration 000026's header comment for the full rationale.
+	//
+	// Pagination/ordering key is still the tuple
+	// (xmin_xid8(sync_changelog.xmin), server_seq) migration 000025
+	// established -- unchanged in shape, just anchored to sync_changelog's own
+	// xmin (a plain, never-compressed heap table) instead of each entity
+	// table's. xmin_xid8(xmin) < pg_snapshot_xmin(pg_current_snapshot()) is the
+	// same horizon gate as before: only changelog rows whose inserting
+	// transaction is fully, permanently committed as of this pull's MVCC
+	// snapshot are delivered, so a page can never include a row whose
+	// transaction might still be in flight (see migration 000024's comment for
+	// the full invariant). cursor_xid8/cursor_seq are the caller's opaque
+	// cursor's decoded (xid8, server_seq) tuple; page_limit is the
+	// caller-requested page size PLUS ONE (see internal/sync/pull.go), so the
+	// caller can detect "more rows exist beyond this page" without a second
+	// round trip.
+	//
+	// `(user_id = $1 OR user_id IS NULL)` mirrors ListCategoryChangesForUser's
+	// old scoping (a category's changelog row has user_id NULL exactly when
+	// the category itself is a system default): every other entity type's
+	// changelog rows always have user_id set to the actual owner, so this
+	// OR only ever matches system-category rows in practice, never leaking a
+	// non-category row across tenants.
+	//
+	// This query MUST run inside the same REPEATABLE READ transaction as the
+	// rest of a single pull request (internal/sync/pull.go opens it), so
+	// pg_current_snapshot() resolves to one stable snapshot for the horizon
+	// gate.
+	ListChangelogPage(ctx context.Context, arg ListChangelogPageParams) ([]ListChangelogPageRow, error)
 	ListDevicesByUser(ctx context.Context, userID pgtype.UUID) ([]Device, error)
-	// One page of GET /v1/sync/changes's "focus_sessions" entity. See
-	// ListActivityEventChangesForUser's doc comment for the pagination,
-	// tenant-scoping, and xmin-horizon rationale, which applies identically
-	// here.
-	ListFocusSessionChangesForUser(ctx context.Context, arg ListFocusSessionChangesForUserParams) ([]ListFocusSessionChangesForUserRow, error)
 	// Keyset-paginated list for GET /v1/focus-sessions, per
 	// documentation/api-reference.md §Conventions. Scoped by user_id per
 	// documentation/security.md §Tenant Isolation; excludes soft-deleted rows.
 	ListFocusSessionsForUser(ctx context.Context, arg ListFocusSessionsForUserParams) ([]FocusSession, error)
-	// One page of GET /v1/sync/changes's "projects" entity. See
-	// ListActivityEventChangesForUser's doc comment for the pagination and
-	// xmin-horizon rationale.
-	ListProjectChangesForUser(ctx context.Context, arg ListProjectChangesForUserParams) ([]ListProjectChangesForUserRow, error)
 	// Keyset-paginated list for GET /v1/projects, per
 	// documentation/api-reference.md §Conventions ("list endpoints ... use a
 	// cursor-based convention"). Soft-deleted rows are excluded: a CRUD list is
@@ -223,22 +240,10 @@ type Querier interface {
 	// /v1/sync/changes serves that). Scoped by user_id per
 	// documentation/security.md §Tenant Isolation.
 	ListProjectsForUser(ctx context.Context, arg ListProjectsForUserParams) ([]Project, error)
-	// One page of GET /v1/sync/changes's "tags" entity. See
-	// ListActivityEventChangesForUser's doc comment for the pagination and
-	// xmin-horizon rationale.
-	ListTagChangesForUser(ctx context.Context, arg ListTagChangesForUserParams) ([]ListTagChangesForUserRow, error)
 	// Keyset-paginated list for GET /v1/tags, per
 	// documentation/api-reference.md §Conventions. Scoped by user_id per
 	// documentation/security.md §Tenant Isolation; excludes soft-deleted rows.
 	ListTagsForUser(ctx context.Context, arg ListTagsForUserParams) ([]Tag, error)
-	// One page of GET /v1/sync/changes's "user_app_settings" entity.
-	// user_app_settings has no deleted_at/deleted column (see
-	// documentation/database-schema.md), so every row from this query is an
-	// upsert; internal/sync's pull service always reports an empty
-	// "tombstones" array for this entity type. See
-	// ListActivityEventChangesForUser's doc comment for the pagination and
-	// xmin-horizon rationale.
-	ListUserAppSettingChangesForUser(ctx context.Context, arg ListUserAppSettingChangesForUserParams) ([]ListUserAppSettingChangesForUserRow, error)
 	// Scoped by user_id per documentation/security.md §Tenant Isolation.
 	RevokeDevice(ctx context.Context, arg RevokeDeviceParams) error
 	RevokeRefreshTokenFamily(ctx context.Context, familyID pgtype.UUID) error

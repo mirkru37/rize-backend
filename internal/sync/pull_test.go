@@ -86,11 +86,22 @@ func insertUserCategory(t *testing.T, pool *pgxpool.Pool, user storedb.User, suf
 
 // TestPullPagination proves multi-page keyset pagination behaves per
 // documentation/sync-protocol.md §Pull: a first page bounded by limit
-// reports has_more=true and a next_cursor that, when re-requested, yields
-// the remaining rows with has_more=false, with no row skipped or
-// duplicated across the two pages (beyond redelivery, which is
-// documented-safe, but this test asserts no row is missing and no row not
-// yet inserted appears).
+// reports has_more=true and, walking next_cursor until has_more is false,
+// every inserted tag is eventually delivered exactly-at-least-once with no
+// row skipped (beyond redelivery, which is documented-safe).
+//
+// RIZ-34 (pivot): unlike the pre-changelog design, which paginated each
+// entity type independently so a page's "tags" upserts count could be
+// asserted exactly against the requested limit, this implementation
+// paginates a SINGLE feed (sync_changelog) shared across every entity
+// type -- so page 1 with limit=2 can legitimately be consumed entirely by
+// OTHER entity types' changelog rows that sort earlier in (xid8,
+// server_seq) order (e.g. the system-default categories seeded once by
+// migration 000026's backfill, which exist for every user and sort ahead
+// of anything this test just inserted). This test therefore only asserts
+// on the eventual, whole-walk outcome, not on any single page's
+// per-entity-type composition -- exactly per this file's other
+// multi-entity/categories pagination tests below.
 func TestPullPagination(t *testing.T) {
 	pool := testPool(t)
 	q := storedb.New(pool)
@@ -106,33 +117,18 @@ func TestPullPagination(t *testing.T) {
 		ids[id] = true
 	}
 
-	// First page: limit=2, expect has_more=true.
-	page1, err := svc.pull(ctx, userIDString(user), "", 2)
-	if err != nil {
-		t.Fatalf("pull (page 1): %v", err)
-	}
-	tagsPage1 := page1.Changes["tags"].Upserts
-	if len(tagsPage1) != 2 {
-		t.Fatalf("page 1 tags upserts = %d, want 2", len(tagsPage1))
-	}
-	if !page1.HasMore {
-		t.Fatalf("page 1 has_more = false, want true (5 tags exist, limit=2)")
-	}
-
 	seen := map[string]bool{}
-	for _, u := range tagsPage1 {
-		dto := u.(tagUpsertDTO)
-		seen[dto.ID] = true
-	}
-
-	// Walk the rest of the pages until has_more is false, collecting every
-	// tag id delivered.
-	cursor := page1.NextCursor
-	hasMore := page1.HasMore
+	cursor := ""
+	hasMore := true
+	pages := 0
 	for hasMore {
+		pages++
+		if pages > total+20 {
+			t.Fatalf("pull did not converge after %d pages (stuck cursor?)", pages)
+		}
 		page, err := svc.pull(ctx, userIDString(user), cursor, 2)
 		if err != nil {
-			t.Fatalf("pull (subsequent page): %v", err)
+			t.Fatalf("pull (page %d): %v", pages, err)
 		}
 		for _, u := range page.Changes["tags"].Upserts {
 			dto := u.(tagUpsertDTO)
@@ -140,6 +136,9 @@ func TestPullPagination(t *testing.T) {
 		}
 		cursor = page.NextCursor
 		hasMore = page.HasMore
+	}
+	if pages < 2 {
+		t.Fatalf("pull converged in a single page, want at least 2 (5 tags + system categories exceed limit=2)")
 	}
 
 	for id := range ids {
@@ -707,5 +706,290 @@ func TestPullReversedInterleavingCommitOrderedCursor(t *testing.T) {
 	}
 	if !foundInFlight {
 		t.Fatalf("the reversed-interleaving row (lower server_seq, higher xid) was permanently skipped once committed — next_cursor advanced past it")
+	}
+}
+
+// TestPullActivityEventCompressedChunkRegression is the fatal-bug
+// regression test motivating RIZ-34's pivot to sync_changelog (migration
+// 000026): it forces the activity_events chunk holding a freshly-pushed
+// event to compress (exactly what migration 000011's 30-day compression
+// policy eventually does on its own), then proves a pull of that event
+// still succeeds and delivers it.
+//
+// This test MUST FAIL against the pre-pivot design (migrations
+// 000024/000025), which paginated activity_events directly by
+// `xmin_xid8(ae.xmin)` — TimescaleDB rejects any system-column reference
+// other than tableoid against a compressed chunk
+// ("transparent decompression only supports tableoid system column"), so
+// that query 500s permanently once the chunk is compressed. Post-pivot,
+// pagination lives entirely on sync_changelog (a plain, never-hypertable,
+// never-compressed table), and the only query that still touches
+// activity_events directly (GetActivityEventForChangelogEntry) reads only
+// ordinary columns — no system-column reference at all — which
+// TimescaleDB permits unconditionally against a compressed chunk.
+func TestPullActivityEventCompressedChunkRegression(t *testing.T) {
+	pool := testPool(t)
+	q := storedb.New(pool)
+	user, device := newUser(t, q)
+	svc := &Service{Queries: q, Pool: pool}
+	ctx := context.Background()
+
+	eventID := newUUIDv7(t)
+	suffix := randomSuffix(t)
+	startedAt := time.Now().UTC().Truncate(time.Second)
+	endedAt := startedAt.Add(5 * time.Minute)
+
+	pushResp, err := svc.push(ctx, userIDString(user), pushRequest{
+		DeviceID: device.ID.String(),
+		Items:    []pushItem{activityEventItem(t, eventID, "com.example.compressed."+suffix, startedAt, endedAt)},
+	})
+	if err != nil {
+		t.Fatalf("push (fixture): %v", err)
+	}
+	if pushResp.Results[0].Status != "applied" {
+		t.Fatalf("push (fixture) status = %q, want applied", pushResp.Results[0].Status)
+	}
+
+	// TimescaleDB refuses to compress ANY chunk of a hypertable that has a
+	// foreign key pointing INTO it (compress_chunk: "found a FK into a
+	// chunk while truncating") — event_tags' composite FK to
+	// activity_events (migration 000013) is exactly that, even though no
+	// code in this repo populates event_tags yet. Drop it for the duration
+	// of this test (restored via t.Cleanup) so compress_chunk below can
+	// run; this mirrors the real 30-day compression policy eventually
+	// hitting this exact restriction in production once event_tags rows
+	// exist, which is a pre-existing, separate concern from this ticket's
+	// pull-pagination fix and out of scope to resolve here.
+	if _, err := pool.Exec(ctx, `ALTER TABLE event_tags DROP CONSTRAINT event_tags_activity_event_fk`); err != nil {
+		t.Fatalf("drop event_tags FK: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `
+			ALTER TABLE event_tags ADD CONSTRAINT event_tags_activity_event_fk
+				FOREIGN KEY (user_id, started_at, entity_id)
+				REFERENCES activity_events (user_id, started_at, event_id)`)
+	})
+
+	// Force every activity_events chunk to compress. if_not_compressed=true
+	// makes this safe to call even though other tests' chunks (same
+	// 7-day chunk interval) may already be compressed from a prior run.
+	if _, err := pool.Exec(ctx, `SELECT compress_chunk(c, if_not_compressed => true) FROM show_chunks('activity_events') c`); err != nil {
+		t.Fatalf("compress_chunk: %v", err)
+	}
+
+	resp, err := svc.pull(ctx, userIDString(user), "", 500)
+	if err != nil {
+		t.Fatalf("pull after chunk compression: %v (must succeed — see migration 000026's header comment)", err)
+	}
+	found := false
+	for _, u := range resp.Changes["activity_events"].Upserts {
+		if u.(activityEventUpsertDTO).EventID == eventID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("pull did not deliver the activity_event after its hypertable chunk was compressed")
+	}
+}
+
+// TestPullActivityEventTombstoneDeliveryViaChangelog proves an
+// activity_event tombstone push is delivered by the sync_changelog-backed
+// pull as a tombstone (never re-delivered as an upsert), closing the
+// coverage gap the pre-pivot design's per-entity-type test suite never
+// exercised for activity_events specifically (TestPullTombstoneDelivery
+// above only covers projects).
+func TestPullActivityEventTombstoneDeliveryViaChangelog(t *testing.T) {
+	pool := testPool(t)
+	q := storedb.New(pool)
+	user, device := newUser(t, q)
+	svc := &Service{Queries: q, Pool: pool}
+	ctx := context.Background()
+
+	eventID := newUUIDv7(t)
+	suffix := randomSuffix(t)
+	startedAt := time.Now().UTC().Truncate(time.Second)
+	endedAt := startedAt.Add(5 * time.Minute)
+	bundleID := "com.example.changelog." + suffix
+
+	if _, err := svc.push(ctx, userIDString(user), pushRequest{
+		DeviceID: device.ID.String(),
+		Items:    []pushItem{activityEventItemFull(t, eventID, bundleID, startedAt, endedAt, textPtr("app_active"), false)},
+	}); err != nil {
+		t.Fatalf("push (create): %v", err)
+	}
+
+	first, err := svc.pull(ctx, userIDString(user), "", 500)
+	if err != nil {
+		t.Fatalf("pull (before tombstone): %v", err)
+	}
+	foundUpsert := false
+	for _, u := range first.Changes["activity_events"].Upserts {
+		if u.(activityEventUpsertDTO).EventID == eventID {
+			foundUpsert = true
+		}
+	}
+	if !foundUpsert {
+		t.Fatalf("first pull did not include the created activity_event as an upsert")
+	}
+
+	if _, err := svc.push(ctx, userIDString(user), pushRequest{
+		DeviceID: device.ID.String(),
+		Items:    []pushItem{activityEventItemFull(t, eventID, bundleID, startedAt, endedAt, textPtr("app_active"), true)},
+	}); err != nil {
+		t.Fatalf("push (tombstone): %v", err)
+	}
+
+	second, err := svc.pull(ctx, userIDString(user), first.NextCursor, 500)
+	if err != nil {
+		t.Fatalf("pull (after tombstone): %v", err)
+	}
+	foundTombstone := false
+	for _, ts := range second.Changes["activity_events"].Tombstones {
+		if ts.(activityEventTombstoneDTO).EventID == eventID {
+			foundTombstone = true
+		}
+	}
+	if !foundTombstone {
+		t.Fatalf("second pull did not deliver the activity_event tombstone")
+	}
+	for _, u := range second.Changes["activity_events"].Upserts {
+		if u.(activityEventUpsertDTO).EventID == eventID {
+			t.Fatalf("second pull delivered the tombstoned activity_event as an upsert, not a tombstone")
+		}
+	}
+}
+
+// TestPullDedupeWithinPageKeepsLatestState proves that when the same
+// entity is written to twice before a pull ever observes it (so both
+// writes' sync_changelog rows land in the SAME page), the pull delivers
+// exactly ONE upsert for that entity — reflecting its LATEST state, not
+// the stale intermediate one — rather than two upserts or the first
+// write's now-superseded values. This is the "dedupe-within-page" behavior
+// internal/sync/pull.go's doc comment describes.
+func TestPullDedupeWithinPageKeepsLatestState(t *testing.T) {
+	pool := testPool(t)
+	q := storedb.New(pool)
+	user, _ := newUser(t, q)
+	svc := &Service{Queries: q, Pool: pool}
+	ctx := context.Background()
+
+	suffix := randomSuffix(t)
+	tagID := insertTag(t, pool, user, suffix, 0)
+
+	// Two updates before any pull observes the tag: both produce a
+	// sync_changelog row (migration 000026's tags_log_change trigger fires
+	// on every UPDATE), so both land in the same page below.
+	if _, err := pool.Exec(ctx, `UPDATE tags SET name = $2, updated_at = now() WHERE id = $1`,
+		mustParseUUID(t, tagID), "dedupe-first-"+suffix); err != nil {
+		t.Fatalf("first update: %v", err)
+	}
+	finalName := "dedupe-second-" + suffix
+	if _, err := pool.Exec(ctx, `UPDATE tags SET name = $2, updated_at = now() WHERE id = $1`,
+		mustParseUUID(t, tagID), finalName); err != nil {
+		t.Fatalf("second update: %v", err)
+	}
+
+	resp, err := svc.pull(ctx, userIDString(user), "", 500)
+	if err != nil {
+		t.Fatalf("pull: %v", err)
+	}
+
+	matches := 0
+	var lastName string
+	for _, u := range resp.Changes["tags"].Upserts {
+		dto := u.(tagUpsertDTO)
+		if dto.ID == tagID {
+			matches++
+			lastName = dto.Name
+		}
+	}
+	if matches != 1 {
+		t.Fatalf("tag id %s appeared %d times in one page's upserts, want exactly 1 (dedupe-within-page)", tagID, matches)
+	}
+	if lastName != finalName {
+		t.Fatalf("deduped upsert's name = %q, want the LATEST write's name %q", lastName, finalName)
+	}
+}
+
+// TestPullBackfillDeliversPreExistingRows proves migration 000026's
+// backfill mechanism: a syncable row that existed BEFORE its
+// sync_changelog entry was ever recorded (simulating a row written before
+// this migration ran, when no *_log_change trigger existed yet to record
+// it automatically) is still discoverable by a fresh cursor once a
+// changelog row is backfilled for it — exactly the
+// `INSERT INTO sync_changelog (...) SELECT ... FROM tags` statement
+// migration 000026 runs once, for every pre-existing row, at migration
+// time.
+//
+// This test reproduces that scenario directly rather than re-running the
+// migration from scratch (which already ran once against this database
+// and cannot be meaningfully re-applied to prove the point): it inserts a
+// tag with the tags_log_change trigger disabled (so the row exists with NO
+// changelog entry, exactly like a pre-migration row before 000026 backfilled
+// it), then runs the identical backfill INSERT migration 000026 uses,
+// scoped to just this one row, and proves a fresh-cursor pull discovers it.
+func TestPullBackfillDeliversPreExistingRows(t *testing.T) {
+	pool := testPool(t)
+	q := storedb.New(pool)
+	user, _ := newUser(t, q)
+	svc := &Service{Queries: q, Pool: pool}
+	ctx := context.Background()
+
+	suffix := randomSuffix(t)
+	tagID := newUUIDv7(t)
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `ALTER TABLE tags DISABLE TRIGGER tags_log_change`); err != nil {
+		t.Fatalf("disable trigger: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO tags (id, user_id, name, updated_at) VALUES ($1, $2, $3, now())`,
+		mustParseUUID(t, tagID), user.ID, "backfill-pre-existing-"+suffix); err != nil {
+		t.Fatalf("insert tag (trigger disabled): %v", err)
+	}
+	if _, err := tx.Exec(ctx, `ALTER TABLE tags ENABLE TRIGGER tags_log_change`); err != nil {
+		t.Fatalf("re-enable trigger: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	// Sanity check: with no changelog entry at all, the row is invisible to
+	// a fresh pull.
+	before, err := svc.pull(ctx, userIDString(user), "", 500)
+	if err != nil {
+		t.Fatalf("pull (before backfill): %v", err)
+	}
+	for _, u := range before.Changes["tags"].Upserts {
+		if u.(tagUpsertDTO).ID == tagID {
+			t.Fatalf("tag was visible before any changelog row was backfilled for it (test setup is broken)")
+		}
+	}
+
+	// The exact backfill statement migration 000026 runs for every
+	// pre-existing tags row, scoped here to just this one.
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO sync_changelog (user_id, entity_type, entity_id, server_seq)
+		SELECT user_id, 'tags', id, server_seq FROM tags WHERE id = $1`, mustParseUUID(t, tagID)); err != nil {
+		t.Fatalf("backfill insert: %v", err)
+	}
+
+	after, err := svc.pull(ctx, userIDString(user), "", 500)
+	if err != nil {
+		t.Fatalf("pull (after backfill): %v", err)
+	}
+	found := false
+	for _, u := range after.Changes["tags"].Upserts {
+		if u.(tagUpsertDTO).ID == tagID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("backfilled tag was not delivered to a fresh cursor")
 	}
 }

@@ -241,19 +241,7 @@ func (f *fakeQuerier) GetTagForUser(context.Context, storedb.GetTagForUserParams
 	return storedb.Tag{}, errNotImplementedByFakeQuerier
 }
 
-func (f *fakeQuerier) ListActivityEventChangesForUser(context.Context, storedb.ListActivityEventChangesForUserParams) ([]storedb.ListActivityEventChangesForUserRow, error) {
-	return nil, errNotImplementedByFakeQuerier
-}
-
 func (f *fakeQuerier) ListCategoriesForUser(context.Context, storedb.ListCategoriesForUserParams) ([]storedb.Category, error) {
-	return nil, errNotImplementedByFakeQuerier
-}
-
-func (f *fakeQuerier) ListCategoryChangesForUser(context.Context, storedb.ListCategoryChangesForUserParams) ([]storedb.ListCategoryChangesForUserRow, error) {
-	return nil, errNotImplementedByFakeQuerier
-}
-
-func (f *fakeQuerier) ListFocusSessionChangesForUser(context.Context, storedb.ListFocusSessionChangesForUserParams) ([]storedb.ListFocusSessionChangesForUserRow, error) {
 	return nil, errNotImplementedByFakeQuerier
 }
 
@@ -261,15 +249,7 @@ func (f *fakeQuerier) ListFocusSessionsForUser(context.Context, storedb.ListFocu
 	return nil, errNotImplementedByFakeQuerier
 }
 
-func (f *fakeQuerier) ListProjectChangesForUser(context.Context, storedb.ListProjectChangesForUserParams) ([]storedb.ListProjectChangesForUserRow, error) {
-	return nil, errNotImplementedByFakeQuerier
-}
-
 func (f *fakeQuerier) ListProjectsForUser(context.Context, storedb.ListProjectsForUserParams) ([]storedb.Project, error) {
-	return nil, errNotImplementedByFakeQuerier
-}
-
-func (f *fakeQuerier) ListTagChangesForUser(context.Context, storedb.ListTagChangesForUserParams) ([]storedb.ListTagChangesForUserRow, error) {
 	return nil, errNotImplementedByFakeQuerier
 }
 
@@ -277,8 +257,32 @@ func (f *fakeQuerier) ListTagsForUser(context.Context, storedb.ListTagsForUserPa
 	return nil, errNotImplementedByFakeQuerier
 }
 
-func (f *fakeQuerier) ListUserAppSettingChangesForUser(context.Context, storedb.ListUserAppSettingChangesForUserParams) ([]storedb.ListUserAppSettingChangesForUserRow, error) {
+func (f *fakeQuerier) ListChangelogPage(context.Context, storedb.ListChangelogPageParams) ([]storedb.ListChangelogPageRow, error) {
 	return nil, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) GetActivityEventForChangelogEntry(context.Context, storedb.GetActivityEventForChangelogEntryParams) (storedb.GetActivityEventForChangelogEntryRow, error) {
+	return storedb.GetActivityEventForChangelogEntryRow{}, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) GetFocusSessionForChangelogEntry(context.Context, storedb.GetFocusSessionForChangelogEntryParams) (storedb.GetFocusSessionForChangelogEntryRow, error) {
+	return storedb.GetFocusSessionForChangelogEntryRow{}, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) GetProjectForChangelogEntry(context.Context, storedb.GetProjectForChangelogEntryParams) (storedb.GetProjectForChangelogEntryRow, error) {
+	return storedb.GetProjectForChangelogEntryRow{}, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) GetTagForChangelogEntry(context.Context, storedb.GetTagForChangelogEntryParams) (storedb.GetTagForChangelogEntryRow, error) {
+	return storedb.GetTagForChangelogEntryRow{}, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) GetUserAppSettingForChangelogEntry(context.Context, storedb.GetUserAppSettingForChangelogEntryParams) (storedb.UserAppSetting, error) {
+	return storedb.UserAppSetting{}, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) GetCategoryForChangelogEntry(context.Context, storedb.GetCategoryForChangelogEntryParams) (storedb.GetCategoryForChangelogEntryRow, error) {
+	return storedb.GetCategoryForChangelogEntryRow{}, errNotImplementedByFakeQuerier
 }
 
 func (f *fakeQuerier) SoftDeleteFocusSessionForUser(context.Context, storedb.SoftDeleteFocusSessionForUserParams) (int64, error) {
