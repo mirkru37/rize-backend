@@ -1,0 +1,30 @@
+# Binaries
+/bin/
+/dist/
+/api
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test / coverage
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Env files
+.env
+.env.*
+!.env.example
+
+# Go build cache / vendor
+/vendor/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
