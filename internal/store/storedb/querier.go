@@ -93,6 +93,18 @@ type Querier interface {
 	// server_seq is bumped by the users_set_server_seq BEFORE UPDATE trigger
 	// (see migration 000022).
 	SoftDeleteUser(ctx context.Context, id pgtype.UUID) error
+	// Applies a tombstone push (documentation/sync-protocol.md: "tombstoning
+	// an existing event is a subsequent push of the same event_id with
+	// deleted: true and the same started_at ... no other field may change on
+	// a tombstone push") against a row that already exists under its
+	// idempotency key (user_id, event_id, started_at) — i.e. InsertActivityEvent
+	// found a conflict and the incoming item is a delete. Only the deleted
+	// column is written, preserving the append-only invariant that no other
+	// column may be mutated after ingestion. WHERE deleted = false makes a
+	// second tombstone push against an already-deleted row a no-op (zero rows
+	// returned), which the caller reports as "duplicate" rather than
+	// re-"applying" it.
+	TombstoneActivityEvent(ctx context.Context, arg TombstoneActivityEventParams) (ActivityEvent, error)
 	// Scoped by user_id per documentation/security.md §Tenant Isolation.
 	TouchDeviceLastSeen(ctx context.Context, arg TouchDeviceLastSeenParams) error
 	// Scoped by user_id per documentation/security.md §Tenant Isolation. Used

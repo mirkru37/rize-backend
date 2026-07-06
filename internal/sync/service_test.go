@@ -3,6 +3,7 @@ package sync
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -446,5 +447,79 @@ func TestPushActivityEventInvalidTypeRejected(t *testing.T) {
 	}
 	if resp.Results[0].Error == nil || resp.Results[0].Error.Code != "VALIDATION_ERROR" {
 		t.Errorf("results[0].Error = %+v, want a VALIDATION_ERROR", resp.Results[0].Error)
+	}
+}
+
+// TestPushActivityEventTombstone proves that a create followed by a
+// tombstone push (same event_id/started_at, deleted: true) flips the
+// stored row's `deleted` flag to true without changing any other column,
+// and is reported "applied" — not silently dropped as "duplicate" — per
+// RIZ-33 code-review fix (HIGH-4).
+func TestPushActivityEventTombstone(t *testing.T) {
+	pool := testPool(t)
+	q := storedb.New(pool)
+	user, device := newUser(t, q)
+	svc := &Service{Queries: q}
+	ctx := context.Background()
+
+	suffix := randomSuffix(t)
+	eventID := newUUIDv7(t)
+	startedAt := time.Now().UTC().Truncate(time.Second)
+	endedAt := startedAt.Add(5 * time.Minute)
+	bundleID := "com.example.tombstone." + suffix
+
+	create, err := svc.push(ctx, userIDString(user), pushRequest{
+		DeviceID: device.ID.String(),
+		Items:    []pushItem{activityEventItemFull(t, eventID, bundleID, startedAt, endedAt, textPtr("app_active"), false)},
+	})
+	if err != nil {
+		t.Fatalf("push (create): %v", err)
+	}
+	if create.Results[0].Status != "applied" {
+		t.Fatalf("create status = %q, want applied", create.Results[0].Status)
+	}
+
+	tombstone, err := svc.push(ctx, userIDString(user), pushRequest{
+		DeviceID: device.ID.String(),
+		Items:    []pushItem{activityEventItemFull(t, eventID, bundleID, startedAt, endedAt, textPtr("app_active"), true)},
+	})
+	if err != nil {
+		t.Fatalf("push (tombstone): %v", err)
+	}
+	if tombstone.Results[0].Status != "applied" {
+		t.Fatalf("tombstone status = %q, want applied", tombstone.Results[0].Status)
+	}
+
+	var (
+		deleted                      bool
+		storedType, storedWindow     sql.NullString
+		storedStartedAt, storedEnded time.Time
+	)
+	err = pool.QueryRow(ctx, `SELECT deleted, type, window_title, started_at, ended_at FROM activity_events WHERE user_id = $1 AND event_id = $2`,
+		user.ID, mustParseUUID(t, eventID)).Scan(&deleted, &storedType, &storedWindow, &storedStartedAt, &storedEnded)
+	if err != nil {
+		t.Fatalf("select activity_events: %v", err)
+	}
+	if !deleted {
+		t.Error("stored deleted = false, want true after tombstone push")
+	}
+	if storedType.String != "app_active" {
+		t.Errorf("stored type = %q, want unchanged %q", storedType.String, "app_active")
+	}
+	if !storedStartedAt.Equal(startedAt) || !storedEnded.Equal(endedAt) {
+		t.Errorf("stored started_at/ended_at = %v/%v, want unchanged %v/%v", storedStartedAt, storedEnded, startedAt, endedAt)
+	}
+
+	// Re-pushing the same tombstone a second time must be a no-op,
+	// reported as "duplicate".
+	again, err := svc.push(ctx, userIDString(user), pushRequest{
+		DeviceID: device.ID.String(),
+		Items:    []pushItem{activityEventItemFull(t, eventID, bundleID, startedAt, endedAt, textPtr("app_active"), true)},
+	})
+	if err != nil {
+		t.Fatalf("push (re-tombstone): %v", err)
+	}
+	if again.Results[0].Status != "duplicate" {
+		t.Fatalf("re-tombstone status = %q, want duplicate", again.Results[0].Status)
 	}
 }

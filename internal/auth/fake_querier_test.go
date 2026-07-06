@@ -189,6 +189,10 @@ func (f *fakeQuerier) InsertActivityEvent(context.Context, storedb.InsertActivit
 	return storedb.ActivityEvent{}, errNotImplementedByFakeQuerier
 }
 
+func (f *fakeQuerier) TombstoneActivityEvent(context.Context, storedb.TombstoneActivityEventParams) (storedb.ActivityEvent, error) {
+	return storedb.ActivityEvent{}, errNotImplementedByFakeQuerier
+}
+
 func (f *fakeQuerier) UpsertFocusSession(context.Context, storedb.UpsertFocusSessionParams) (storedb.FocusSession, error) {
 	return storedb.FocusSession{}, errNotImplementedByFakeQuerier
 }

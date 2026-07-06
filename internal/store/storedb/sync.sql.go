@@ -218,6 +218,56 @@ func (q *Queries) InsertActivityEvent(ctx context.Context, arg InsertActivityEve
 	return i, err
 }
 
+const tombstoneActivityEvent = `-- name: TombstoneActivityEvent :one
+UPDATE activity_events
+SET deleted = true
+WHERE user_id = $1 AND event_id = $2 AND started_at = $3 AND deleted = false
+RETURNING event_id, user_id, device_id, started_at, ended_at, duration_s, type, source, precision, app_id, raw_bundle_id, window_title, url, category_id, project_id, deleted, inserted_at, server_seq
+`
+
+type TombstoneActivityEventParams struct {
+	UserID    pgtype.UUID        `json:"user_id"`
+	EventID   pgtype.UUID        `json:"event_id"`
+	StartedAt pgtype.Timestamptz `json:"started_at"`
+}
+
+// Applies a tombstone push (documentation/sync-protocol.md: "tombstoning
+// an existing event is a subsequent push of the same event_id with
+// deleted: true and the same started_at ... no other field may change on
+// a tombstone push") against a row that already exists under its
+// idempotency key (user_id, event_id, started_at) — i.e. InsertActivityEvent
+// found a conflict and the incoming item is a delete. Only the deleted
+// column is written, preserving the append-only invariant that no other
+// column may be mutated after ingestion. WHERE deleted = false makes a
+// second tombstone push against an already-deleted row a no-op (zero rows
+// returned), which the caller reports as "duplicate" rather than
+// re-"applying" it.
+func (q *Queries) TombstoneActivityEvent(ctx context.Context, arg TombstoneActivityEventParams) (ActivityEvent, error) {
+	row := q.db.QueryRow(ctx, tombstoneActivityEvent, arg.UserID, arg.EventID, arg.StartedAt)
+	var i ActivityEvent
+	err := row.Scan(
+		&i.EventID,
+		&i.UserID,
+		&i.DeviceID,
+		&i.StartedAt,
+		&i.EndedAt,
+		&i.DurationS,
+		&i.Type,
+		&i.Source,
+		&i.Precision,
+		&i.AppID,
+		&i.RawBundleID,
+		&i.WindowTitle,
+		&i.Url,
+		&i.CategoryID,
+		&i.ProjectID,
+		&i.Deleted,
+		&i.InsertedAt,
+		&i.ServerSeq,
+	)
+	return i, err
+}
+
 const upsertFocusSession = `-- name: UpsertFocusSession :one
 INSERT INTO focus_sessions (
     id, user_id, device_id, project_id, kind, planned_duration_s,

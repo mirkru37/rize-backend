@@ -199,11 +199,13 @@ func (s *Service) applyActivityEvent(ctx context.Context, userID, deviceID pgtyp
 		return pushResult{}, fmt.Errorf("resolve category: %w", err)
 	}
 
+	startedAtTs := pgtype.Timestamptz{Time: startedAt, Valid: true}
+
 	_, err = s.Queries.InsertActivityEvent(ctx, storedb.InsertActivityEventParams{
 		EventID:     eventID,
 		UserID:      userID,
 		DeviceID:    deviceID,
-		StartedAt:   pgtype.Timestamptz{Time: startedAt, Valid: true},
+		StartedAt:   startedAtTs,
 		EndedAt:     pgtype.Timestamptz{Time: endedAt, Valid: true},
 		Type:        eventType,
 		Source:      source,
@@ -217,13 +219,37 @@ func (s *Service) applyActivityEvent(ctx context.Context, userID, deviceID pgtyp
 		Deleted:     data.Deleted,
 	})
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			// ON CONFLICT DO NOTHING found an existing row under this
-			// idempotency key: a no-op replay of an already-ingested
-			// event, per documentation/sync-protocol.md §Entity Classes.
-			return duplicateActivityEvent(index, data.EventID), nil
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return pushResult{}, fmt.Errorf("insert activity event: %w", err)
 		}
-		return pushResult{}, fmt.Errorf("insert activity event: %w", err)
+
+		// ON CONFLICT DO NOTHING found an existing row under this
+		// idempotency key (user_id, event_id, started_at). Per
+		// documentation/sync-protocol.md ("tombstoning an existing event
+		// is a subsequent push of the same event_id with deleted: true
+		// and the same started_at"), a tombstone push against an
+		// already-ingested event must flip that row's deleted flag to
+		// true rather than being silently dropped as a no-op duplicate.
+		if data.Deleted {
+			_, tombErr := s.Queries.TombstoneActivityEvent(ctx, storedb.TombstoneActivityEventParams{
+				UserID:    userID,
+				EventID:   eventID,
+				StartedAt: startedAtTs,
+			})
+			if tombErr != nil {
+				if errors.Is(tombErr, pgx.ErrNoRows) {
+					// The row was already tombstoned by a prior push: a
+					// no-op re-tombstone, reported as "duplicate".
+					return duplicateActivityEvent(index, data.EventID), nil
+				}
+				return pushResult{}, fmt.Errorf("tombstone activity event: %w", tombErr)
+			}
+			return appliedActivityEvent(index, data.EventID), nil
+		}
+
+		// A non-tombstone replay of the same key: a no-op duplicate, per
+		// documentation/sync-protocol.md §Entity Classes.
+		return duplicateActivityEvent(index, data.EventID), nil
 	}
 
 	// server_seq intentionally not echoed for activity_event, see dto.go.

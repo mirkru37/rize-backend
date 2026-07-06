@@ -53,6 +53,23 @@ INSERT INTO activity_events (
 ON CONFLICT ON CONSTRAINT activity_events_idempotency_key DO NOTHING
 RETURNING *;
 
+-- name: TombstoneActivityEvent :one
+-- Applies a tombstone push (documentation/sync-protocol.md: "tombstoning
+-- an existing event is a subsequent push of the same event_id with
+-- deleted: true and the same started_at ... no other field may change on
+-- a tombstone push") against a row that already exists under its
+-- idempotency key (user_id, event_id, started_at) — i.e. InsertActivityEvent
+-- found a conflict and the incoming item is a delete. Only the deleted
+-- column is written, preserving the append-only invariant that no other
+-- column may be mutated after ingestion. WHERE deleted = false makes a
+-- second tombstone push against an already-deleted row a no-op (zero rows
+-- returned), which the caller reports as "duplicate" rather than
+-- re-"applying" it.
+UPDATE activity_events
+SET deleted = true
+WHERE user_id = $1 AND event_id = $2 AND started_at = $3 AND deleted = false
+RETURNING *;
+
 -- name: GetFocusSessionByID :one
 -- Unscoped-by-user lookup used only to distinguish, after an
 -- UpsertFocusSession call returns zero rows, whether the existing row
