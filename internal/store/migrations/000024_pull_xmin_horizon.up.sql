@@ -43,11 +43,17 @@
 --     transaction and the anchor — so xmin actually predates the anchor's
 --     epoch by one: (anchor's epoch - 1, xmin).
 -- This assumes at most one wraparound occurred between xmin and the
--- current snapshot, i.e. that the row was frozen/vacuumed (or is at most
--- ~2^31 transactions old) well before a second wraparound could occur —
--- exactly the invariant Postgres's own anti-wraparound vacuuming already
--- guarantees for every live row, so no additional assumption is
--- introduced here.
+-- current snapshot, i.e. that the row's raw xmin is at most ~2^31
+-- transactions old relative to the current xid. NOTE: this is NOT the
+-- invariant Postgres's own anti-wraparound vacuuming guarantees — freezing
+-- only preserves a row's VISIBILITY across wraparound, it does not bound
+-- or rewrite the row's raw `xmin` value, which is what we read and use
+-- here as an ORDERING key. The bound this code actually depends on is
+-- external: every live sync_changelog row's raw xmin must stay within
+-- 2^31 transactions of the current xid, which holds only because of the
+-- changelog's retention/pruning policy (tracked as RIZ-72, not yet
+-- implemented as of this migration) rather than anything Postgres
+-- enforces on its own.
 CREATE FUNCTION xid_before_snapshot_horizon(row_xmin xid) RETURNS boolean
 LANGUAGE sql STABLE AS $$
     SELECT CASE

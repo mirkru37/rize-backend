@@ -50,6 +50,17 @@
 -- lookup in internal/sync/pull.go safe. Every other entity type's point
 -- lookup only needs (user_id, entity_id), so event_started_at is left NULL
 -- for them.
+--
+-- Growth is unbounded: one row is appended here per write to any syncable
+-- table, forever, with no pruning. Retention/pruning is intentionally
+-- deferred and tracked as RIZ-72 -- not yet implemented as of this
+-- migration. That deferral is not just a storage concern: pull.go's
+-- keyset pagination correctness depends on every live sync_changelog row's
+-- raw xmin staying within 2^31 transactions of the current xid (the
+-- at-most-one-wraparound bound migration 000024's comment describes), and
+-- that bound is only actually guaranteed by RIZ-72's future retention
+-- policy bounding how long old rows (and their raw xmin values) stick
+-- around -- Postgres's own freezing/vacuuming does not provide it.
 CREATE TABLE sync_changelog (
     changelog_id     bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     user_id          uuid NULL,
