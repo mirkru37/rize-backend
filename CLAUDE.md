@@ -11,6 +11,7 @@ Go backend for Rize-Clone: auth, ingestion, sync, reporting. Stack: Go 1.23+, Ch
 - Every query is scoped by `user_id` from the access token — cross-tenant access paths are a HIGH-severity review finding.
 - Migrations: golang-migrate, forward-only, paired with a `database-schema.md` update.
 - Tests: table-driven; new functionality must be covered before a PR opens.
+- Containerization is a hard requirement: keep the `Dockerfile` (multi-stage Go build) buildable and `docker compose up` (api + TimescaleDB + migrations) working end-to-end; a change that breaks either is a HIGH-severity review finding.
 
 ## Commands
 

@@ -22,6 +22,14 @@ internal/middleware/     request ID, logging, rate limit, auth
 
 ## Quick start
 
+The whole backend runs with Docker — a `Dockerfile` (multi-stage Go build) and a compose file with api + TimescaleDB + a one-shot migration service are required parts of this repo:
+
+```
+docker compose up               # db + migrations + api
+```
+
+For faster iteration, run the binary on the host against the compose-managed database:
+
 ```
 docker compose up -d db        # timescaledb image
 migrate -path internal/store/migrations -database "$DATABASE_URL" up
