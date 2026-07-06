@@ -1,0 +1,9 @@
+ALTER TABLE users ALTER COLUMN server_seq DROP DEFAULT;
+ALTER TABLE categories ALTER COLUMN server_seq DROP DEFAULT;
+ALTER TABLE user_app_settings ALTER COLUMN server_seq DROP DEFAULT;
+ALTER TABLE projects ALTER COLUMN server_seq DROP DEFAULT;
+ALTER TABLE tags ALTER COLUMN server_seq DROP DEFAULT;
+ALTER TABLE activity_events ALTER COLUMN server_seq DROP DEFAULT;
+ALTER TABLE focus_sessions ALTER COLUMN server_seq DROP DEFAULT;
+
+DROP SEQUENCE server_seq_global;
