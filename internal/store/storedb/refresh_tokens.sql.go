@@ -120,6 +120,45 @@ func (q *Queries) RevokeRefreshTokenFamily(ctx context.Context, familyID pgtype.
 	return err
 }
 
+const revokeRefreshTokenFamilyForUser = `-- name: RevokeRefreshTokenFamilyForUser :exec
+UPDATE refresh_tokens
+SET revoked_at = now()
+WHERE family_id = $1 AND user_id = $2 AND revoked_at IS NULL
+`
+
+type RevokeRefreshTokenFamilyForUserParams struct {
+	FamilyID pgtype.UUID `json:"family_id"`
+	UserID   pgtype.UUID `json:"user_id"`
+}
+
+// Scoped by user_id per documentation/security.md §Tenant Isolation: used by
+// logout, where the caller is already authenticated and the family being
+// revoked must belong to them.
+func (q *Queries) RevokeRefreshTokenFamilyForUser(ctx context.Context, arg RevokeRefreshTokenFamilyForUserParams) error {
+	_, err := q.db.Exec(ctx, revokeRefreshTokenFamilyForUser, arg.FamilyID, arg.UserID)
+	return err
+}
+
+const revokeRefreshTokensByDevice = `-- name: RevokeRefreshTokensByDevice :exec
+UPDATE refresh_tokens
+SET revoked_at = now()
+WHERE device_id = $1 AND user_id = $2 AND revoked_at IS NULL
+`
+
+type RevokeRefreshTokensByDeviceParams struct {
+	DeviceID pgtype.UUID `json:"device_id"`
+	UserID   pgtype.UUID `json:"user_id"`
+}
+
+// Scoped by user_id per documentation/security.md §Tenant Isolation. Used by
+// DELETE /v1/devices/{id}, which must revoke every refresh token ever issued
+// to that device (not just the currently active family) per
+// documentation/security.md §Token model.
+func (q *Queries) RevokeRefreshTokensByDevice(ctx context.Context, arg RevokeRefreshTokensByDeviceParams) error {
+	_, err := q.db.Exec(ctx, revokeRefreshTokensByDevice, arg.DeviceID, arg.UserID)
+	return err
+}
+
 const rotateRefreshToken = `-- name: RotateRefreshToken :one
 UPDATE refresh_tokens
 SET revoked_at = now(),

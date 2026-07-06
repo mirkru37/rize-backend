@@ -31,3 +31,27 @@ WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL;
 UPDATE devices
 SET revoked_at = now()
 WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL;
+
+-- name: UpdateDeviceName :one
+-- Scoped by user_id per documentation/security.md §Tenant Isolation. Used by
+-- PATCH /v1/devices/{id} ("Rename a device" per documentation/api-reference.md
+-- §Devices).
+UPDATE devices
+SET name = $3
+WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
+RETURNING *;
+
+-- name: UpdateDeviceMetadata :one
+-- Scoped by user_id per documentation/security.md §Tenant Isolation. Used
+-- during login/refresh to refresh a previously-registered device's
+-- self-reported metadata and last_seen_at, per documentation/security.md
+-- §Token model ("a device row is created/updated and bound to the refresh
+-- token").
+UPDATE devices
+SET name = $3,
+    model = $4,
+    os_version = $5,
+    app_version = $6,
+    last_seen_at = now()
+WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
+RETURNING *;

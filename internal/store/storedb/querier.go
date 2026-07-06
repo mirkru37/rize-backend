@@ -36,10 +36,29 @@ type Querier interface {
 	// Scoped by user_id per documentation/security.md §Tenant Isolation.
 	RevokeDevice(ctx context.Context, arg RevokeDeviceParams) error
 	RevokeRefreshTokenFamily(ctx context.Context, familyID pgtype.UUID) error
+	// Scoped by user_id per documentation/security.md §Tenant Isolation: used by
+	// logout, where the caller is already authenticated and the family being
+	// revoked must belong to them.
+	RevokeRefreshTokenFamilyForUser(ctx context.Context, arg RevokeRefreshTokenFamilyForUserParams) error
+	// Scoped by user_id per documentation/security.md §Tenant Isolation. Used by
+	// DELETE /v1/devices/{id}, which must revoke every refresh token ever issued
+	// to that device (not just the currently active family) per
+	// documentation/security.md §Token model.
+	RevokeRefreshTokensByDevice(ctx context.Context, arg RevokeRefreshTokensByDeviceParams) error
 	RotateRefreshToken(ctx context.Context, arg RotateRefreshTokenParams) (RefreshToken, error)
 	SoftDeleteUser(ctx context.Context, id pgtype.UUID) error
 	// Scoped by user_id per documentation/security.md §Tenant Isolation.
 	TouchDeviceLastSeen(ctx context.Context, arg TouchDeviceLastSeenParams) error
+	// Scoped by user_id per documentation/security.md §Tenant Isolation. Used
+	// during login/refresh to refresh a previously-registered device's
+	// self-reported metadata and last_seen_at, per documentation/security.md
+	// §Token model ("a device row is created/updated and bound to the refresh
+	// token").
+	UpdateDeviceMetadata(ctx context.Context, arg UpdateDeviceMetadataParams) (Device, error)
+	// Scoped by user_id per documentation/security.md §Tenant Isolation. Used by
+	// PATCH /v1/devices/{id} ("Rename a device" per documentation/api-reference.md
+	// §Devices).
+	UpdateDeviceName(ctx context.Context, arg UpdateDeviceNameParams) (Device, error)
 	// server_seq is bumped from the same global sequence used by inserts
 	// (table DEFAULT only applies to INSERTs, so UPDATEs draw from it
 	// explicitly) per documentation/sync-protocol.md.
