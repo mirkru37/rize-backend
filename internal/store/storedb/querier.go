@@ -11,6 +11,14 @@ import (
 )
 
 type Querier interface {
+	// Auto-creates an apps row the first time a bundle_id/platform pair is
+	// observed during ingestion, per documentation/architecture-backend.md
+	// §Ingestion Pipeline ("if no matching row exists, one is created
+	// automatically"). ON CONFLICT DO NOTHING (rather than erroring) makes this
+	// safe to call optimistically under a race with a concurrent ingestion of
+	// the same new bundle_id/platform; a caller that gets zero rows back must
+	// re-fetch via GetAppByBundleID.
+	CreateApp(ctx context.Context, arg CreateAppParams) (App, error)
 	CreateDevice(ctx context.Context, arg CreateDeviceParams) (Device, error)
 	CreateRefreshToken(ctx context.Context, arg CreateRefreshTokenParams) (RefreshToken, error)
 	// Callers pass the desired role explicitly ('user' by default); the
@@ -18,15 +26,27 @@ type Querier interface {
 	// is omitted from an INSERT's column list, which sqlc's generated,
 	// fully-columned INSERT never does.
 	//
-	// server_seq is intentionally omitted from the column list so the
-	// table-level DEFAULT nextval('server_seq_global') assigns it, keeping
-	// every syncable table's server_seq drawn from the same global sequence
-	// space per documentation/sync-protocol.md.
+	// server_seq is intentionally omitted from the column list: the
+	// users_set_server_seq BEFORE INSERT trigger (see migration 000022)
+	// unconditionally assigns it from the shared server_seq_global sequence,
+	// keeping every syncable table's server_seq drawn from the same global
+	// sequence space per documentation/sync-protocol.md.
 	CreateUser(ctx context.Context, arg CreateUserParams) (User, error)
+	// Looks up the global app-catalog row for a (bundle_id, platform) pair, per
+	// documentation/database-schema.md's `UNIQUE (bundle_id, platform)` on
+	// `apps`. Not user-scoped: the catalog is global/cross-user by design (see
+	// documentation/architecture-backend.md §Ingestion Pipeline, stage 2).
+	GetAppByBundleID(ctx context.Context, arg GetAppByBundleIDParams) (App, error)
 	// Scoped by user_id per documentation/security.md §Tenant Isolation: every
 	// query is scoped by user_id from the access token, so a request
 	// authenticated as one user can never read another user's device row.
 	GetDeviceByID(ctx context.Context, arg GetDeviceByIDParams) (Device, error)
+	// Unscoped-by-user lookup used only to distinguish, after an
+	// UpsertFocusSession call returns zero rows, whether the existing row
+	// under this id belongs to a different user entirely (a tenant-isolation
+	// violation, reported as "invalid") from a same-user last-write-wins loss
+	// (reported as "duplicate") — see internal/sync's push service.
+	GetFocusSessionByID(ctx context.Context, id pgtype.UUID) (FocusSession, error)
 	GetRefreshTokenByHash(ctx context.Context, tokenHash []byte) (RefreshToken, error)
 	// Blocking row lock, used only after GetRefreshTokenByHashForUpdateNoWait
 	// has detected contention: waits for the concurrently in-flight rotation to
@@ -38,9 +58,23 @@ type Querier interface {
 	// this exact token" from "I am the only one looking at this row right now",
 	// per documentation/security.md's refresh-rotation flow (RIZ-32 M2).
 	GetRefreshTokenByHashForUpdateNoWait(ctx context.Context, tokenHash []byte) (RefreshToken, error)
+	// The user-specific override consulted by category resolution's first
+	// fallback step, per documentation/architecture-backend.md §Ingestion
+	// Pipeline stage 3. Scoped by user_id per documentation/security.md
+	// §Tenant Isolation.
+	GetUserAppSettingByUserAndApp(ctx context.Context, arg GetUserAppSettingByUserAndAppParams) (UserAppSetting, error)
 	GetUserByAppleUserID(ctx context.Context, appleUserID *string) (User, error)
 	GetUserByEmail(ctx context.Context, email *string) (User, error)
 	GetUserByID(ctx context.Context, id pgtype.UUID) (User, error)
+	// Idempotent insert for the append-only activity_events hypertable, per
+	// documentation/sync-protocol.md §Entity Classes ("Idempotency key is the
+	// composite UNIQUE (user_id, event_id, started_at) constraint"). ON
+	// CONFLICT DO NOTHING means a retried/replayed push of the same event
+	// returns zero rows, which the caller reports as a "duplicate" per-item
+	// result rather than an error. Scoped by user_id (the row is created for
+	// the authenticated caller only, never for a user_id supplied by the
+	// request body) per documentation/security.md §Tenant Isolation.
+	InsertActivityEvent(ctx context.Context, arg InsertActivityEventParams) (ActivityEvent, error)
 	ListActiveRefreshTokensByUser(ctx context.Context, userID pgtype.UUID) ([]RefreshToken, error)
 	ListDevicesByUser(ctx context.Context, userID pgtype.UUID) ([]Device, error)
 	// Scoped by user_id per documentation/security.md §Tenant Isolation.
@@ -56,6 +90,8 @@ type Querier interface {
 	// documentation/security.md §Token model.
 	RevokeRefreshTokensByDevice(ctx context.Context, arg RevokeRefreshTokensByDeviceParams) error
 	RotateRefreshToken(ctx context.Context, arg RotateRefreshTokenParams) (RefreshToken, error)
+	// server_seq is bumped by the users_set_server_seq BEFORE UPDATE trigger
+	// (see migration 000022).
 	SoftDeleteUser(ctx context.Context, id pgtype.UUID) error
 	// Scoped by user_id per documentation/security.md §Tenant Isolation.
 	TouchDeviceLastSeen(ctx context.Context, arg TouchDeviceLastSeenParams) error
@@ -69,10 +105,23 @@ type Querier interface {
 	// PATCH /v1/devices/{id} ("Rename a device" per documentation/api-reference.md
 	// §Devices).
 	UpdateDeviceName(ctx context.Context, arg UpdateDeviceNameParams) (Device, error)
-	// server_seq is bumped from the same global sequence used by inserts
-	// (table DEFAULT only applies to INSERTs, so UPDATEs draw from it
-	// explicitly) per documentation/sync-protocol.md.
+	// server_seq is bumped by the users_set_server_seq BEFORE UPDATE trigger
+	// (see migration 000022), which draws from the same server_seq_global
+	// sequence used by inserts, per documentation/sync-protocol.md. Callers no
+	// longer need to (and must not) set server_seq explicitly on UPDATE — the
+	// trigger overwrites whatever value is present.
 	UpdateUserProfile(ctx context.Context, arg UpdateUserProfileParams) (User, error)
+	// Last-write-wins upsert for focus_sessions, per
+	// documentation/sync-protocol.md §Entity Classes ("Server compares [the
+	// client-supplied updated_at] against the currently stored updated_at for
+	// that id ... Whichever timestamp wins, the server persists that version
+	// and bumps server_seq on the row"). The WHERE clause on the DO UPDATE
+	// branch is both the LWW comparison (existing.updated_at < new.updated_at)
+	// and a tenant-isolation guard (existing.user_id = new.user_id): if id
+	// collides with a row owned by a different user, or the incoming write is
+	// not newer, zero rows are returned and the caller distinguishes the two
+	// cases via GetFocusSessionByID.
+	UpsertFocusSession(ctx context.Context, arg UpsertFocusSessionParams) (FocusSession, error)
 }
 
 var _ Querier = (*Queries)(nil)

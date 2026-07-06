@@ -4,10 +4,11 @@
 -- is omitted from an INSERT's column list, which sqlc's generated,
 -- fully-columned INSERT never does.
 --
--- server_seq is intentionally omitted from the column list so the
--- table-level DEFAULT nextval('server_seq_global') assigns it, keeping
--- every syncable table's server_seq drawn from the same global sequence
--- space per documentation/sync-protocol.md.
+-- server_seq is intentionally omitted from the column list: the
+-- users_set_server_seq BEFORE INSERT trigger (see migration 000022)
+-- unconditionally assigns it from the shared server_seq_global sequence,
+-- keeping every syncable table's server_seq drawn from the same global
+-- sequence space per documentation/sync-protocol.md.
 INSERT INTO users (
     id, email, password_hash, apple_user_id, display_name, role, timezone,
     created_at, updated_at
@@ -30,19 +31,21 @@ SELECT * FROM users
 WHERE apple_user_id = $1 AND deleted_at IS NULL;
 
 -- name: UpdateUserProfile :one
--- server_seq is bumped from the same global sequence used by inserts
--- (table DEFAULT only applies to INSERTs, so UPDATEs draw from it
--- explicitly) per documentation/sync-protocol.md.
+-- server_seq is bumped by the users_set_server_seq BEFORE UPDATE trigger
+-- (see migration 000022), which draws from the same server_seq_global
+-- sequence used by inserts, per documentation/sync-protocol.md. Callers no
+-- longer need to (and must not) set server_seq explicitly on UPDATE — the
+-- trigger overwrites whatever value is present.
 UPDATE users
 SET display_name = $2,
     timezone = $3,
-    updated_at = now(),
-    server_seq = nextval('server_seq_global')
+    updated_at = now()
 WHERE id = $1 AND deleted_at IS NULL
 RETURNING *;
 
 -- name: SoftDeleteUser :exec
+-- server_seq is bumped by the users_set_server_seq BEFORE UPDATE trigger
+-- (see migration 000022).
 UPDATE users
-SET deleted_at = now(),
-    server_seq = nextval('server_seq_global')
+SET deleted_at = now()
 WHERE id = $1 AND deleted_at IS NULL;
