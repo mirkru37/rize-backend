@@ -165,9 +165,9 @@ type User struct {
 	Email        *string            `json:"email"`
 	PasswordHash *string            `json:"password_hash"`
 	AppleUserID  *string            `json:"apple_user_id"`
-	DisplayName  string             `json:"display_name"`
+	DisplayName  *string            `json:"display_name"`
 	Role         string             `json:"role"`
-	Timezone     string             `json:"timezone"`
+	Timezone     *string            `json:"timezone"`
 	CreatedAt    pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
 	DeletedAt    pgtype.Timestamptz `json:"deleted_at"`

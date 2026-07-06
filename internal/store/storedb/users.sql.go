@@ -14,10 +14,10 @@ import (
 const createUser = `-- name: CreateUser :one
 INSERT INTO users (
     id, email, password_hash, apple_user_id, display_name, role, timezone,
-    created_at, updated_at, server_seq
+    created_at, updated_at
 ) VALUES (
     gen_random_uuid(), $1, $2, $3, $4, $5, $6,
-    now(), now(), $7
+    now(), now()
 )
 RETURNING id, email, password_hash, apple_user_id, display_name, role, timezone, created_at, updated_at, deleted_at, server_seq
 `
@@ -26,16 +26,20 @@ type CreateUserParams struct {
 	Email        *string `json:"email"`
 	PasswordHash *string `json:"password_hash"`
 	AppleUserID  *string `json:"apple_user_id"`
-	DisplayName  string  `json:"display_name"`
+	DisplayName  *string `json:"display_name"`
 	Role         string  `json:"role"`
-	Timezone     string  `json:"timezone"`
-	ServerSeq    int64   `json:"server_seq"`
+	Timezone     *string `json:"timezone"`
 }
 
 // Callers pass the desired role explicitly ('user' by default); the
 // database-side DEFAULT 'user' on this column only applies when the column
 // is omitted from an INSERT's column list, which sqlc's generated,
 // fully-columned INSERT never does.
+//
+// server_seq is intentionally omitted from the column list so the
+// table-level DEFAULT nextval('server_seq_global') assigns it, keeping
+// every syncable table's server_seq drawn from the same global sequence
+// space per documentation/sync-protocol.md.
 func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, error) {
 	row := q.db.QueryRow(ctx, createUser,
 		arg.Email,
@@ -44,7 +48,6 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 		arg.DisplayName,
 		arg.Role,
 		arg.Timezone,
-		arg.ServerSeq,
 	)
 	var i User
 	err := row.Scan(
@@ -138,17 +141,12 @@ func (q *Queries) GetUserByID(ctx context.Context, id pgtype.UUID) (User, error)
 const softDeleteUser = `-- name: SoftDeleteUser :exec
 UPDATE users
 SET deleted_at = now(),
-    server_seq = $2
+    server_seq = nextval('server_seq_global')
 WHERE id = $1 AND deleted_at IS NULL
 `
 
-type SoftDeleteUserParams struct {
-	ID        pgtype.UUID `json:"id"`
-	ServerSeq int64       `json:"server_seq"`
-}
-
-func (q *Queries) SoftDeleteUser(ctx context.Context, arg SoftDeleteUserParams) error {
-	_, err := q.db.Exec(ctx, softDeleteUser, arg.ID, arg.ServerSeq)
+func (q *Queries) SoftDeleteUser(ctx context.Context, id pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, softDeleteUser, id)
 	return err
 }
 
@@ -157,25 +155,22 @@ UPDATE users
 SET display_name = $2,
     timezone = $3,
     updated_at = now(),
-    server_seq = $4
+    server_seq = nextval('server_seq_global')
 WHERE id = $1 AND deleted_at IS NULL
 RETURNING id, email, password_hash, apple_user_id, display_name, role, timezone, created_at, updated_at, deleted_at, server_seq
 `
 
 type UpdateUserProfileParams struct {
 	ID          pgtype.UUID `json:"id"`
-	DisplayName string      `json:"display_name"`
-	Timezone    string      `json:"timezone"`
-	ServerSeq   int64       `json:"server_seq"`
+	DisplayName *string     `json:"display_name"`
+	Timezone    *string     `json:"timezone"`
 }
 
+// server_seq is bumped from the same global sequence used by inserts
+// (table DEFAULT only applies to INSERTs, so UPDATEs draw from it
+// explicitly) per documentation/sync-protocol.md.
 func (q *Queries) UpdateUserProfile(ctx context.Context, arg UpdateUserProfileParams) (User, error) {
-	row := q.db.QueryRow(ctx, updateUserProfile,
-		arg.ID,
-		arg.DisplayName,
-		arg.Timezone,
-		arg.ServerSeq,
-	)
+	row := q.db.QueryRow(ctx, updateUserProfile, arg.ID, arg.DisplayName, arg.Timezone)
 	var i User
 	err := row.Scan(
 		&i.ID,
