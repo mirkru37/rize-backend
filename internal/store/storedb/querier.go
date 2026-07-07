@@ -291,6 +291,48 @@ type Querier interface {
 	// the window before merging. Joins apps/categories/projects so the report
 	// layer never needs a second round trip to resolve display names.
 	RawActivityEventsForReport(ctx context.Context, arg RawActivityEventsForReportParams) ([]RawActivityEventsForReportRow, error)
+	// Atomically records a failed password check against an existing account
+	// and, if the post-increment attempt count reaches @threshold, escalates
+	// into (or re-escalates) a lockout — per RIZ-59 / documentation/security.md
+	// §API hardening ("brute-force lockout on login").
+	//
+	// Everything is computed from the row's own current values inside this
+	// single UPDATE statement (failed_login_attempts, lockout_count), rather
+	// than read in Go and written back separately, so concurrent logins
+	// against the same account can never race a read-modify-write: Postgres's
+	// row-level write lock on this UPDATE serializes concurrent callers, and
+	// each one sees the effect of the previous one's commit.
+	//
+	// The lockout duration is base_duration_seconds doubled once per prior
+	// lockout (lockout_count, read BEFORE this attempt's own increment),
+	// capped at max_duration_seconds. The doubling/capping arithmetic is done
+	// entirely in the seconds (float8) domain — LEAST() runs BEFORE the value
+	// is ever converted to an interval — because converting the uncapped
+	// doubled value to an interval first can overflow Postgres's interval
+	// range once lockout_count gets large (observed at lockout_count >= 34
+	// under concurrent-attempt bursts), which would make this UPDATE error
+	// out and turn a login into a 500 instead of the standard 401 envelope —
+	// itself a reachable no-oracle break.
+	//
+	// Both the lockout_count escalation and the locked_until assignment are
+	// additionally guarded on "not currently locked"
+	// (locked_until IS NULL OR locked_until <= @now): without this guard,
+	// concurrent failed attempts that all land after the row is already
+	// locked (each serialized in turn by this UPDATE's row lock, but each
+	// still satisfying "failed_login_attempts + 1 >= threshold" since the
+	// counter only grows) would each re-escalate lockout_count once per
+	// attempt rather than once per lockout episode, inflating the doubling
+	// exponent far faster than one escalation per actual lockout — which is
+	// exactly what fed the interval-overflow bug above.
+	//
+	// @now is supplied by the caller (the service's injectable clock) rather
+	// than Postgres's own now(), so the lockout window is deterministic and
+	// testable under a fake clock.
+	RecordFailedLoginAttempt(ctx context.Context, arg RecordFailedLoginAttemptParams) (User, error)
+	// Clears failed-attempt/lockout-escalation state on a successful login,
+	// per RIZ-59's reset semantics ("counter and lockout-escalation reset on
+	// successful login after expiry").
+	ResetLoginLockout(ctx context.Context, arg ResetLoginLockoutParams) error
 	// Scoped by user_id per documentation/security.md §Tenant Isolation.
 	RevokeDevice(ctx context.Context, arg RevokeDeviceParams) error
 	RevokeRefreshTokenFamily(ctx context.Context, familyID pgtype.UUID) error

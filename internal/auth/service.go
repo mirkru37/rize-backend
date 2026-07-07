@@ -118,6 +118,58 @@ type Service struct {
 	Pool       Beginner
 	SigningKey *rsa.PrivateKey
 	Now        func() time.Time
+
+	// LockoutThreshold, LockoutBaseDuration, and LockoutMaxDuration
+	// configure Login's per-account brute-force lockout (RIZ-59), per
+	// documentation/security.md §API hardening ("brute-force lockout on
+	// login"). Any field left at its zero value falls back to the
+	// package's Default* constant below (see lockoutThreshold /
+	// lockoutBaseDuration / lockoutMaxDuration) — mirroring how a nil Now
+	// falls back to time.Now — so tests and zero-value Services keep
+	// working without having to set every knob explicitly.
+	LockoutThreshold    int
+	LockoutBaseDuration time.Duration
+	LockoutMaxDuration  time.Duration
+}
+
+// Default lockout parameters, used by lockoutThreshold/lockoutBaseDuration/
+// lockoutMaxDuration when the corresponding Service field is left at its
+// zero value. These mirror config.Default{AuthLockoutThreshold,
+// AuthLockoutBaseDuration,AuthLockoutMaxDuration}; internal/auth cannot
+// import internal/config (which would be a layering inversion), so the
+// values are duplicated here and cmd/api/main.go is responsible for wiring
+// the configured values through to Service at construction time.
+const (
+	DefaultLockoutThreshold    = 10
+	DefaultLockoutBaseDuration = 15 * time.Minute
+	DefaultLockoutMaxDuration  = 24 * time.Hour
+)
+
+// lockoutThreshold returns s.LockoutThreshold if set, otherwise
+// DefaultLockoutThreshold.
+func (s *Service) lockoutThreshold() int {
+	if s.LockoutThreshold > 0 {
+		return s.LockoutThreshold
+	}
+	return DefaultLockoutThreshold
+}
+
+// lockoutBaseDuration returns s.LockoutBaseDuration if set, otherwise
+// DefaultLockoutBaseDuration.
+func (s *Service) lockoutBaseDuration() time.Duration {
+	if s.LockoutBaseDuration > 0 {
+		return s.LockoutBaseDuration
+	}
+	return DefaultLockoutBaseDuration
+}
+
+// lockoutMaxDuration returns s.LockoutMaxDuration if set, otherwise
+// DefaultLockoutMaxDuration.
+func (s *Service) lockoutMaxDuration() time.Duration {
+	if s.LockoutMaxDuration > 0 {
+		return s.LockoutMaxDuration
+	}
+	return DefaultLockoutMaxDuration
 }
 
 func newResult(user storedb.User, device storedb.Device, accessToken, refreshToken string) Result {

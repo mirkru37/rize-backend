@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 
@@ -586,6 +587,77 @@ func (f *fakeQuerier) UpdateUserProfile(_ context.Context, arg storedb.UpdateUse
 	u.ServerSeq = f.nextSeq()
 	f.users[arg.ID.String()] = u
 	return u, nil
+}
+
+// RecordFailedLoginAttempt mirrors login_lockout.sql's
+// RecordFailedLoginAttempt: it increments failed_login_attempts and, if the
+// post-increment count reaches arg.Threshold, escalates lockout_count and
+// sets locked_until to arg.Now plus a doubling-per-prior-lockout duration
+// capped at MaxDurationSeconds — computed from the row's own
+// pre-increment lockout_count, matching the real query's single-statement
+// atomicity (this fake holds f.mu for the whole operation, so concurrent
+// callers in the same test process serialize the same way a real UPDATE's
+// row lock would).
+func (f *fakeQuerier) RecordFailedLoginAttempt(_ context.Context, arg storedb.RecordFailedLoginAttemptParams) (storedb.User, error) {
+	if hit, err := f.takeInjectedFailure("RecordFailedLoginAttempt"); hit {
+		return storedb.User{}, err
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	u, ok := f.users[arg.ID.String()]
+	if !ok || u.DeletedAt.Valid {
+		return storedb.User{}, pgx.ErrNoRows
+	}
+
+	u.FailedLoginAttempts++
+	notCurrentlyLocked := !u.LockedUntil.Valid || !u.LockedUntil.Time.After(arg.Now.Time)
+	if notCurrentlyLocked && u.FailedLoginAttempts >= arg.Threshold {
+		// Guarded on "not currently locked" to mirror login_lockout.sql's
+		// fix (RIZ-59 review, MEDIUM finding): without this guard,
+		// concurrent failed attempts landing after the row is already
+		// locked would each re-escalate lockout_count once per attempt
+		// instead of once per lockout episode.
+		duration := arg.BaseDurationSeconds * math.Pow(2, float64(u.LockoutCount))
+		if duration > arg.MaxDurationSeconds {
+			duration = arg.MaxDurationSeconds
+		}
+		u.LockoutCount++
+		u.LockedUntil = pgtype.Timestamptz{
+			Time:  arg.Now.Time.Add(time.Duration(duration * float64(time.Second))),
+			Valid: true,
+		}
+	}
+	u.UpdatedAt = arg.Now
+
+	f.users[arg.ID.String()] = u
+	return u, nil
+}
+
+// ResetLoginLockout mirrors login_lockout.sql's ResetLoginLockout: it
+// clears failed_login_attempts, lockout_count, and locked_until on a
+// successful login.
+func (f *fakeQuerier) ResetLoginLockout(_ context.Context, arg storedb.ResetLoginLockoutParams) error {
+	if hit, err := f.takeInjectedFailure("ResetLoginLockout"); hit {
+		return err
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	u, ok := f.users[arg.ID.String()]
+	if !ok || u.DeletedAt.Valid {
+		return pgx.ErrNoRows
+	}
+
+	u.FailedLoginAttempts = 0
+	u.LockoutCount = 0
+	u.LockedUntil = pgtype.Timestamptz{}
+	u.UpdatedAt = arg.Now
+
+	f.users[arg.ID.String()] = u
+	return nil
 }
 
 var _ storedb.Querier = (*fakeQuerier)(nil)

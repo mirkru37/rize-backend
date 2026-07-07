@@ -19,7 +19,7 @@ INSERT INTO users (
     gen_random_uuid(), $1, $2, $3, $4, $5, $6,
     now(), now()
 )
-RETURNING id, email, password_hash, apple_user_id, display_name, role, timezone, created_at, updated_at, deleted_at, server_seq
+RETURNING id, email, password_hash, apple_user_id, display_name, role, timezone, created_at, updated_at, deleted_at, server_seq, failed_login_attempts, lockout_count, locked_until
 `
 
 type CreateUserParams struct {
@@ -63,12 +63,15 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 		&i.UpdatedAt,
 		&i.DeletedAt,
 		&i.ServerSeq,
+		&i.FailedLoginAttempts,
+		&i.LockoutCount,
+		&i.LockedUntil,
 	)
 	return i, err
 }
 
 const getUserByAppleUserID = `-- name: GetUserByAppleUserID :one
-SELECT id, email, password_hash, apple_user_id, display_name, role, timezone, created_at, updated_at, deleted_at, server_seq FROM users
+SELECT id, email, password_hash, apple_user_id, display_name, role, timezone, created_at, updated_at, deleted_at, server_seq, failed_login_attempts, lockout_count, locked_until FROM users
 WHERE apple_user_id = $1 AND deleted_at IS NULL
 `
 
@@ -87,12 +90,15 @@ func (q *Queries) GetUserByAppleUserID(ctx context.Context, appleUserID *string)
 		&i.UpdatedAt,
 		&i.DeletedAt,
 		&i.ServerSeq,
+		&i.FailedLoginAttempts,
+		&i.LockoutCount,
+		&i.LockedUntil,
 	)
 	return i, err
 }
 
 const getUserByEmail = `-- name: GetUserByEmail :one
-SELECT id, email, password_hash, apple_user_id, display_name, role, timezone, created_at, updated_at, deleted_at, server_seq FROM users
+SELECT id, email, password_hash, apple_user_id, display_name, role, timezone, created_at, updated_at, deleted_at, server_seq, failed_login_attempts, lockout_count, locked_until FROM users
 WHERE email = $1 AND deleted_at IS NULL
 `
 
@@ -111,12 +117,15 @@ func (q *Queries) GetUserByEmail(ctx context.Context, email *string) (User, erro
 		&i.UpdatedAt,
 		&i.DeletedAt,
 		&i.ServerSeq,
+		&i.FailedLoginAttempts,
+		&i.LockoutCount,
+		&i.LockedUntil,
 	)
 	return i, err
 }
 
 const getUserByID = `-- name: GetUserByID :one
-SELECT id, email, password_hash, apple_user_id, display_name, role, timezone, created_at, updated_at, deleted_at, server_seq FROM users
+SELECT id, email, password_hash, apple_user_id, display_name, role, timezone, created_at, updated_at, deleted_at, server_seq, failed_login_attempts, lockout_count, locked_until FROM users
 WHERE id = $1 AND deleted_at IS NULL
 `
 
@@ -135,6 +144,9 @@ func (q *Queries) GetUserByID(ctx context.Context, id pgtype.UUID) (User, error)
 		&i.UpdatedAt,
 		&i.DeletedAt,
 		&i.ServerSeq,
+		&i.FailedLoginAttempts,
+		&i.LockoutCount,
+		&i.LockedUntil,
 	)
 	return i, err
 }
@@ -158,7 +170,7 @@ SET display_name = $2,
     timezone = $3,
     updated_at = now()
 WHERE id = $1 AND deleted_at IS NULL
-RETURNING id, email, password_hash, apple_user_id, display_name, role, timezone, created_at, updated_at, deleted_at, server_seq
+RETURNING id, email, password_hash, apple_user_id, display_name, role, timezone, created_at, updated_at, deleted_at, server_seq, failed_login_attempts, lockout_count, locked_until
 `
 
 type UpdateUserProfileParams struct {
@@ -187,6 +199,9 @@ func (q *Queries) UpdateUserProfile(ctx context.Context, arg UpdateUserProfilePa
 		&i.UpdatedAt,
 		&i.DeletedAt,
 		&i.ServerSeq,
+		&i.FailedLoginAttempts,
+		&i.LockoutCount,
+		&i.LockedUntil,
 	)
 	return i, err
 }

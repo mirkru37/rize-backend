@@ -28,6 +28,14 @@ func (s stubQuerier) GetUserByEmail(ctx context.Context, email *string) (storedb
 	return s.getUserByEmail(ctx, email)
 }
 
+// RecordFailedLoginAttempt is a no-op stub: the "wrong password on a real
+// account" scenario below now reaches RIZ-59's failed-attempt bookkeeping
+// after VerifyPassword returns false, but this whitebox test only cares
+// about verifyDecoyPassword call counts, not lockout state.
+func (stubQuerier) RecordFailedLoginAttempt(context.Context, storedb.RecordFailedLoginAttemptParams) (storedb.User, error) {
+	return storedb.User{}, nil
+}
+
 func testSigningKeyInternal(t *testing.T) *rsa.PrivateKey {
 	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)

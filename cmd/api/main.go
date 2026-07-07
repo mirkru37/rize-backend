@@ -156,7 +156,14 @@ func newRouter(logger *slog.Logger, cfg config.Config, pool *pgxpool.Pool) http.
 		queries = storedb.New(pool)
 		beginner = pool
 	}
-	authService := &auth.Service{Queries: queries, Pool: beginner, SigningKey: signingKey}
+	authService := &auth.Service{
+		Queries:             queries,
+		Pool:                beginner,
+		SigningKey:          signingKey,
+		LockoutThreshold:    cfg.AuthLockoutThreshold,
+		LockoutBaseDuration: cfg.AuthLockoutBaseDuration,
+		LockoutMaxDuration:  cfg.AuthLockoutMaxDuration,
+	}
 	authHandler := auth.NewHandler(authService)
 
 	var syncBeginner sync.Beginner

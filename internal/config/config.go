@@ -50,6 +50,21 @@ const (
 	// DefaultIdleTimeout bounds how long the server keeps an idle
 	// keep-alive connection open before closing it.
 	DefaultIdleTimeout = 120 * time.Second
+
+	// DefaultAuthLockoutThreshold is used when AUTH_LOCKOUT_THRESHOLD is
+	// not set: the number of consecutive failed login attempts against a
+	// single account that triggers a lockout, per RIZ-59 /
+	// documentation/security.md §API hardening ("brute-force lockout on
+	// login").
+	DefaultAuthLockoutThreshold = 10
+	// DefaultAuthLockoutBaseDuration is used when AUTH_LOCKOUT_BASE_DURATION
+	// is not set: the lockout duration applied the first time an account is
+	// locked. Each subsequent lockout on the same account doubles the
+	// previous duration, capped at DefaultAuthLockoutMaxDuration.
+	DefaultAuthLockoutBaseDuration = 15 * time.Minute
+	// DefaultAuthLockoutMaxDuration is used when AUTH_LOCKOUT_MAX_DURATION
+	// is not set: the ceiling the doubling lockout duration is capped at.
+	DefaultAuthLockoutMaxDuration = 24 * time.Hour
 )
 
 // EnvVarNames lists every environment variable Load reads. It exists so
@@ -64,6 +79,9 @@ var EnvVarNames = []string{
 	"CORS_ALLOWED_ORIGINS",
 	"RATE_LIMIT_REQUESTS_PER_MINUTE",
 	"SHUTDOWN_TIMEOUT_SECONDS",
+	"AUTH_LOCKOUT_THRESHOLD",
+	"AUTH_LOCKOUT_BASE_DURATION",
+	"AUTH_LOCKOUT_MAX_DURATION",
 }
 
 // Config holds rize-backend's runtime configuration, loaded from
@@ -124,6 +142,18 @@ type Config struct {
 	// IdleTimeout bounds how long the HTTP server keeps an idle
 	// keep-alive connection open before closing it.
 	IdleTimeout time.Duration
+
+	// AuthLockoutThreshold is the number of consecutive failed login
+	// attempts against a single account that triggers a lockout, per
+	// documentation/security.md §API hardening.
+	AuthLockoutThreshold int
+	// AuthLockoutBaseDuration is the lockout duration applied the first
+	// time an account is locked; each subsequent lockout on the same
+	// account doubles the previous duration, capped at
+	// AuthLockoutMaxDuration.
+	AuthLockoutBaseDuration time.Duration
+	// AuthLockoutMaxDuration caps the doubling lockout duration.
+	AuthLockoutMaxDuration time.Duration
 }
 
 // Load builds a Config from environment variables, applying defaults for
@@ -142,6 +172,9 @@ func Load() (Config, error) {
 		ReadTimeout:                DefaultReadTimeout,
 		WriteTimeout:               DefaultWriteTimeout,
 		IdleTimeout:                DefaultIdleTimeout,
+		AuthLockoutThreshold:       DefaultAuthLockoutThreshold,
+		AuthLockoutBaseDuration:    DefaultAuthLockoutBaseDuration,
+		AuthLockoutMaxDuration:     DefaultAuthLockoutMaxDuration,
 	}
 
 	if v := os.Getenv("RATE_LIMIT_REQUESTS_PER_MINUTE"); v != "" {
@@ -164,6 +197,46 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("invalid SHUTDOWN_TIMEOUT_SECONDS %q: must be positive", v)
 		}
 		cfg.ShutdownTimeout = time.Duration(n) * time.Second
+	}
+
+	if v := os.Getenv("AUTH_LOCKOUT_THRESHOLD"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("invalid AUTH_LOCKOUT_THRESHOLD %q: %w", v, err)
+		}
+		if n <= 0 {
+			return Config{}, fmt.Errorf("invalid AUTH_LOCKOUT_THRESHOLD %q: must be positive", v)
+		}
+		cfg.AuthLockoutThreshold = n
+	}
+
+	if v := os.Getenv("AUTH_LOCKOUT_BASE_DURATION"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("invalid AUTH_LOCKOUT_BASE_DURATION %q: %w", v, err)
+		}
+		if d <= 0 {
+			return Config{}, fmt.Errorf("invalid AUTH_LOCKOUT_BASE_DURATION %q: must be positive", v)
+		}
+		cfg.AuthLockoutBaseDuration = d
+	}
+
+	if v := os.Getenv("AUTH_LOCKOUT_MAX_DURATION"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("invalid AUTH_LOCKOUT_MAX_DURATION %q: %w", v, err)
+		}
+		if d <= 0 {
+			return Config{}, fmt.Errorf("invalid AUTH_LOCKOUT_MAX_DURATION %q: must be positive", v)
+		}
+		cfg.AuthLockoutMaxDuration = d
+	}
+
+	if cfg.AuthLockoutMaxDuration < cfg.AuthLockoutBaseDuration {
+		return Config{}, fmt.Errorf(
+			"invalid AUTH_LOCKOUT_MAX_DURATION %q: must be >= AUTH_LOCKOUT_BASE_DURATION %q",
+			cfg.AuthLockoutMaxDuration, cfg.AuthLockoutBaseDuration,
+		)
 	}
 
 	if cfg.HTTPPort == "" {
