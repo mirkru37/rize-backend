@@ -1,0 +1,59 @@
+name: Deploy API Docs
+
+# RIZ-51: publishes the static Redoc docs site rendered from
+# openapi/openapi.yaml to GitHub Pages on every push to main. Requires a
+# one-time repo setting: Settings -> Pages -> Build and deployment ->
+# Source = "GitHub Actions" (documented in docs/api-docs.md and the RIZ-51
+# PR description; this workflow cannot toggle that setting itself).
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: deploy-docs
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Render docs site
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Lint OpenAPI spec
+        run: npx --yes @redocly/cli@2.37.0 lint openapi/openapi.yaml
+
+      - name: Render static docs site
+        run: |
+          mkdir -p site
+          npx --yes @redocly/cli@2.37.0 build-docs openapi/openapi.yaml -o site/index.html
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

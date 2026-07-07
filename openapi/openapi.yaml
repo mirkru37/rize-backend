@@ -1,0 +1,858 @@
+openapi: 3.0.3
+info:
+  title: Rize-Clone Backend API
+  description: >
+    Auth, device registration, sync, activity, and reporting API for the
+    Rize-Clone automatic time tracker. This spec is hand-maintained and
+    validated in CI against the routes actually registered by
+    `cmd/api.newRouter` (see `cmd/api/openapi_conformance_test.go`) — a
+    route that exists here but not in the router, or vice versa, fails
+    `go test ./cmd/api/...`. The wire-level contract this spec describes is
+    documentation/api-reference.md; see that document for prose semantics,
+    worked examples, and rate-limit/error-slug conventions.
+  version: "1.0"
+  license:
+    name: Proprietary
+servers:
+  - url: https://api.rize-clone.example
+    description: Production (see documentation/api-reference.md §Conventions)
+
+tags:
+  - name: Auth
+  - name: Users
+  - name: Devices
+  - name: Sync
+  - name: Activities & Reports
+  - name: Projects
+  - name: Tags
+  - name: Categories
+  - name: Focus Sessions
+  - name: Admin
+  - name: Ops
+
+paths:
+  /healthz:
+    get:
+      tags: [Ops]
+      summary: Liveness check
+      security: []
+      responses:
+        "200":
+          description: Process is alive
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+
+  /readyz:
+    get:
+      tags: [Ops]
+      summary: Readiness check
+      security: []
+      responses:
+        "200":
+          description: Ready to serve traffic (database reachable, or not configured)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  db: { type: string, example: ok }
+        "503":
+          description: Database configured but unreachable
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: unavailable }
+                  db: { type: string, example: unreachable }
+
+  /metrics:
+    get:
+      tags: [Ops]
+      summary: Prometheus metrics
+      security: []
+      responses:
+        "200":
+          description: Prometheus text exposition format
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /v1/auth/register:
+    post:
+      tags: [Auth]
+      summary: Email + password signup
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RegisterRequest" }
+      responses:
+        "201":
+          description: Account and device created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /v1/auth/login:
+    post:
+      tags: [Auth]
+      summary: Email + password login
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/LoginRequest" }
+      responses:
+        "200":
+          description: Authenticated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Rotate refresh token, issue new access token
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RefreshRequest" }
+      responses:
+        "200":
+          description: New token pair issued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/auth/apple:
+    post:
+      tags: [Auth]
+      summary: Sign in with Apple (identity token exchange) — not implemented
+      description: Out of MVP scope; wired as a `501 Not Implemented` stub.
+      security: []
+      responses:
+        "501": { $ref: "#/components/responses/NotImplemented" }
+
+  /v1/auth/password/forgot:
+    post:
+      tags: [Auth]
+      summary: Request a password reset — not implemented
+      description: Out of MVP scope; wired as a `501 Not Implemented` stub.
+      security: []
+      responses:
+        "501": { $ref: "#/components/responses/NotImplemented" }
+
+  /v1/auth/password/reset:
+    post:
+      tags: [Auth]
+      summary: Complete a password reset — not implemented
+      description: Out of MVP scope; wired as a `501 Not Implemented` stub.
+      security: []
+      responses:
+        "501": { $ref: "#/components/responses/NotImplemented" }
+
+  /v1/auth/logout:
+    post:
+      tags: [Auth]
+      summary: Revoke current refresh token
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token: { type: string }
+      responses:
+        "204": { description: Refresh token revoked }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/users/me:
+    get:
+      tags: [Users]
+      summary: Fetch current user profile
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: Current user
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    patch:
+      tags: [Users]
+      summary: Update current user profile
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                email: { type: string, format: email }
+      responses:
+        "200":
+          description: Updated user
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    delete:
+      tags: [Users]
+      summary: GDPR deletion request (7-day grace period) — not implemented
+      description: Out of MVP scope; wired as a `501 Not Implemented` stub.
+      security: [{ bearerAuth: [] }]
+      responses:
+        "501": { $ref: "#/components/responses/NotImplemented" }
+
+  /v1/users/me/export:
+    post:
+      tags: [Users]
+      summary: Request a data export (JSON dump) — not implemented
+      description: Out of MVP scope; wired as a `501 Not Implemented` stub.
+      security: [{ bearerAuth: [] }]
+      responses:
+        "501": { $ref: "#/components/responses/NotImplemented" }
+
+  /v1/devices:
+    get:
+      tags: [Devices]
+      summary: List devices registered to the current user
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: Devices
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Device" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/devices/{id}:
+    parameters:
+      - $ref: "#/components/parameters/DeviceId"
+    patch:
+      tags: [Devices]
+      summary: Rename a device
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+      responses:
+        "200":
+          description: Updated device
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Device" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [Devices]
+      summary: Revoke a device and its refresh tokens
+      security: [{ bearerAuth: [] }]
+      responses:
+        "204": { description: Device revoked }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/sync/events:
+    post:
+      tags: [Sync]
+      summary: Batched idempotent event ingest (batch <= 500)
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SyncEventsRequest" }
+      responses:
+        "200":
+          description: Per-item ingest results
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SyncEventsResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/sync/changes:
+    get:
+      tags: [Sync]
+      summary: Cursor-based pull of upserts and tombstones
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Page of changes
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SyncChangesResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "410":
+          description: Cursor position has been pruned; client should restart from the beginning
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Problem" }
+
+  /v1/activities:
+    get:
+      tags: [Activities & Reports]
+      summary: Raw events by time range and filters
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Page of activity events
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PaginatedEnvelope" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/reports/summary:
+    get:
+      tags: [Activities & Reports]
+      summary: Aggregate summary report
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200": { description: Summary report, content: { application/json: { schema: { type: object } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/reports/daily:
+    get:
+      tags: [Activities & Reports]
+      summary: Daily breakdown report
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: date
+          in: query
+          schema: { type: string, format: date }
+      responses:
+        "200":
+          description: Daily report
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DailyReport" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/reports/categories:
+    get:
+      tags: [Activities & Reports]
+      summary: Time-by-category report
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200": { description: Category report, content: { application/json: { schema: { type: object } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/reports/apps:
+    get:
+      tags: [Activities & Reports]
+      summary: Time-by-app report
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200": { description: App report, content: { application/json: { schema: { type: object } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/reports/projects:
+    get:
+      tags: [Activities & Reports]
+      summary: Time-by-project report
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200": { description: Project report, content: { application/json: { schema: { type: object } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/reports/timeline:
+    get:
+      tags: [Activities & Reports]
+      summary: Chronological timeline report
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200": { description: Timeline report, content: { application/json: { schema: { type: object } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/projects:
+    get:
+      tags: [Projects]
+      summary: List projects
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Page of projects
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PaginatedEnvelope" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [Projects]
+      summary: Create project
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ProjectWrite" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Project" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/projects/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+    get:
+      tags: [Projects]
+      summary: Get project
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200": { description: Project, content: { application/json: { schema: { $ref: "#/components/schemas/Project" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [Projects]
+      summary: Update project
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ProjectWrite" }
+      responses:
+        "200": { description: Updated project, content: { application/json: { schema: { $ref: "#/components/schemas/Project" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [Projects]
+      summary: Delete project
+      security: [{ bearerAuth: [] }]
+      responses:
+        "204": { description: Deleted }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/tags:
+    get:
+      tags: [Tags]
+      summary: List tags
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200": { description: Page of tags, content: { application/json: { schema: { $ref: "#/components/schemas/PaginatedEnvelope" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [Tags]
+      summary: Create tag
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { name: { type: string } } }
+      responses:
+        "201": { description: Created, content: { application/json: { schema: { type: object } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/tags/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+    get:
+      tags: [Tags]
+      summary: Get tag
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200": { description: Tag, content: { application/json: { schema: { type: object } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [Tags]
+      summary: Update tag
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { name: { type: string } } }
+      responses:
+        "200": { description: Updated tag, content: { application/json: { schema: { type: object } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [Tags]
+      summary: Delete tag
+      security: [{ bearerAuth: [] }]
+      responses:
+        "204": { description: Deleted }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/categories:
+    get:
+      tags: [Categories]
+      summary: List categories
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200": { description: Page of categories, content: { application/json: { schema: { $ref: "#/components/schemas/PaginatedEnvelope" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [Categories]
+      summary: Create category
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { name: { type: string } } }
+      responses:
+        "201": { description: Created, content: { application/json: { schema: { type: object } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/categories/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+    get:
+      tags: [Categories]
+      summary: Get category
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200": { description: Category, content: { application/json: { schema: { type: object } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [Categories]
+      summary: Update category
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { name: { type: string } } }
+      responses:
+        "200": { description: Updated category, content: { application/json: { schema: { type: object } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [Categories]
+      summary: Delete category
+      security: [{ bearerAuth: [] }]
+      responses:
+        "204": { description: Deleted }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/focus-sessions:
+    get:
+      tags: [Focus Sessions]
+      summary: List focus sessions
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200": { description: Page of focus sessions, content: { application/json: { schema: { $ref: "#/components/schemas/PaginatedEnvelope" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [Focus Sessions]
+      summary: Create focus session
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        "201": { description: Created, content: { application/json: { schema: { type: object } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/focus-sessions/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+    get:
+      tags: [Focus Sessions]
+      summary: Get focus session
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200": { description: Focus session, content: { application/json: { schema: { type: object } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [Focus Sessions]
+      summary: Update focus session
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        "200": { description: Updated focus session, content: { application/json: { schema: { type: object } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [Focus Sessions]
+      summary: Delete focus session
+      security: [{ bearerAuth: [] }]
+      responses:
+        "204": { description: Deleted }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/admin/users:
+    get:
+      tags: [Admin]
+      summary: List users — not implemented
+      description: Out of MVP scope; wired as a `501 Not Implemented` stub. Requires role `admin`.
+      security: [{ bearerAuth: [] }]
+      responses:
+        "501": { $ref: "#/components/responses/NotImplemented" }
+
+  /v1/admin/users/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+    patch:
+      tags: [Admin]
+      summary: Update a user — not implemented
+      description: Out of MVP scope; wired as a `501 Not Implemented` stub. Requires role `admin`.
+      security: [{ bearerAuth: [] }]
+      responses:
+        "501": { $ref: "#/components/responses/NotImplemented" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    Cursor:
+      name: cursor
+      in: query
+      description: Opaque pagination cursor from a previous page's `next_cursor`.
+      schema: { type: string }
+    Limit:
+      name: limit
+      in: query
+      description: Page size.
+      schema: { type: integer, minimum: 1 }
+    ResourceId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+    DeviceId:
+      name: id
+      in: path
+      required: true
+      description: Device id (`dev_...`).
+      schema: { type: string }
+
+  responses:
+    BadRequest:
+      description: Malformed request or validation error
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    Unauthorized:
+      description: Missing, invalid, or expired credentials
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    NotFound:
+      description: Resource does not exist or is not owned by the caller
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    Conflict:
+      description: Conflicting resource state (e.g. duplicate email)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    NotImplemented:
+      description: Out of MVP scope — stub endpoint
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Problem" }
+
+  schemas:
+    Problem:
+      type: object
+      description: RFC 7807-style problem body used for every error response.
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+      required: [type, title, status, detail]
+
+    Device:
+      type: object
+      properties:
+        id: { type: string, example: dev_01J2K3M4N5P6Q7R8S9T0U1V2W3 }
+        platform: { type: string, enum: [macos, ios] }
+        name: { type: string }
+        model: { type: string }
+        os_version: { type: string }
+        app_version: { type: string }
+
+    DeviceInput:
+      allOf:
+        - $ref: "#/components/schemas/Device"
+      description: Same shape as Device; `id` is omitted by the client when registering a brand-new device.
+
+    User:
+      type: object
+      properties:
+        id: { type: string, example: usr_01HZX3K4Q9T7V8W9Y0Z1A2B3C4 }
+        email: { type: string, format: email }
+        role: { type: string, enum: [user, admin] }
+
+    AuthResponse:
+      type: object
+      properties:
+        access_token: { type: string }
+        refresh_token: { type: string, example: rt_9f8c1e2a4b3d4c5e8f7a6b5c4d3e2f1a }
+        token_type: { type: string, example: Bearer }
+        expires_in: { type: integer, example: 900 }
+        user: { $ref: "#/components/schemas/User" }
+        device: { $ref: "#/components/schemas/Device" }
+      required: [access_token, refresh_token, token_type, expires_in, user, device]
+
+    RegisterRequest:
+      type: object
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, minLength: 8, maxLength: 1024 }
+        device: { $ref: "#/components/schemas/DeviceInput" }
+      required: [email, password, device]
+
+    LoginRequest:
+      type: object
+      properties:
+        email: { type: string, format: email }
+        password: { type: string }
+        device: { $ref: "#/components/schemas/DeviceInput" }
+      required: [email, password, device]
+
+    RefreshRequest:
+      type: object
+      properties:
+        refresh_token: { type: string }
+        device: { $ref: "#/components/schemas/DeviceInput" }
+      required: [refresh_token]
+
+    PaginatedEnvelope:
+      type: object
+      description: Common list-endpoint envelope (see documentation/api-reference.md §Conventions).
+      properties:
+        data: { type: array, items: {} }
+        next_cursor: { type: string }
+        has_more: { type: boolean }
+      required: [data, has_more]
+
+    ProjectWrite:
+      type: object
+      properties:
+        name: { type: string }
+        color: { type: string }
+
+    Project:
+      allOf:
+        - $ref: "#/components/schemas/ProjectWrite"
+        - type: object
+          properties:
+            id: { type: string }
+
+    SyncEvent:
+      type: object
+      properties:
+        event_id: { type: string }
+        type: { type: string }
+        app: { type: string }
+        started_at: { type: string, format: date-time }
+        ended_at: { type: string, format: date-time }
+      required: [event_id, type, started_at, ended_at]
+
+    SyncEventsRequest:
+      type: object
+      properties:
+        events:
+          type: array
+          maxItems: 500
+          items: { $ref: "#/components/schemas/SyncEvent" }
+      required: [events]
+
+    SyncEventResult:
+      type: object
+      properties:
+        event_id: { type: string }
+        status: { type: string, enum: [applied, duplicate, invalid] }
+        detail: { type: string }
+      required: [event_id, status]
+
+    SyncEventsResponse:
+      type: object
+      properties:
+        results:
+          type: array
+          items: { $ref: "#/components/schemas/SyncEventResult" }
+      required: [results]
+
+    SyncChangesResponse:
+      type: object
+      properties:
+        data: { type: array, items: {} }
+        next_cursor: { type: string }
+        has_more: { type: boolean }
+      required: [data, has_more]
+
+    DailyReport:
+      type: object
+      properties:
+        date: { type: string, format: date }
+        total_tracked_seconds: { type: integer }
+        categories:
+          type: array
+          items:
+            type: object
+            properties:
+              category: { type: string }
+              seconds: { type: integer }
+      required: [date, total_tracked_seconds, categories]

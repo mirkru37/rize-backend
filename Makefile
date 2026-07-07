@@ -1,4 +1,4 @@
-.PHONY: build test coverage lint vuln run ci deploy-bootstrap-check
+.PHONY: build test coverage lint vuln run ci deploy-bootstrap-check api-docs api-docs-lint api-docs-check
 
 # RIZ-69: single source of truth for the minimum acceptable total statement
 # coverage, mirrored by .github/workflows/ci.yml's COVERAGE_THRESHOLD env
@@ -40,6 +40,31 @@ run:
 	go run ./cmd/api
 
 ci: build test lint vuln
+
+# RIZ-51: openapi/openapi.yaml is the hand-maintained OpenAPI 3 spec for the
+# routes registered in cmd/api.newRouter; cmd/api/openapi_conformance_test.go
+# (run as part of `make test` / `go test ./...`) is the drift check — it
+# fails if the spec and the actual route table disagree. These targets
+# render/lint/preview the spec locally; they shell out to @redocly/cli via
+# npx rather than vendoring a Node toolchain into this Go repo, matching
+# .github/workflows/api-docs.yml.
+api-docs-lint:
+	npx --yes @redocly/cli@2.37.0 lint openapi/openapi.yaml
+
+# Renders the static Redoc docs site to site/index.html for local preview
+# (open it directly in a browser; nothing here needs a running server).
+api-docs:
+	mkdir -p site
+	npx --yes @redocly/cli@2.37.0 build-docs openapi/openapi.yaml -o site/index.html
+	@echo "Docs rendered to site/index.html"
+
+# api-docs-check is the local equivalent of the CI docs job's drift gate:
+# lint the spec, run the route-conformance test, and render the docs site
+# (failing the render is itself a signal the spec is malformed beyond what
+# lint/validate catch).
+api-docs-check: api-docs-lint
+	go test ./cmd/api/... -run TestOpenAPI -v
+	$(MAKE) api-docs
 
 # deploy-bootstrap-check prints which of the GCP deploy secrets/vars
 # (see docs/deployment.md) are currently set on this repo, so you can

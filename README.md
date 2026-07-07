@@ -61,6 +61,15 @@ cp .env.example .env
 
 See `internal/sync/retention.go` for the concurrency-safety argument (why a prune can never strand an already-in-flight pull) and `internal/sync/retention_test.go` for the covering tests.
 
+## API docs (RIZ-51)
+
+`openapi/openapi.yaml` is a hand-maintained OpenAPI 3 spec describing the routes actually registered by `cmd/api.newRouter` (including the `501`-stub routes for out-of-MVP-scope endpoints like Sign in with Apple, password reset, GDPR export/delete, and admin). It is the implementation-facing counterpart to [API reference](../documentation/api-reference.md), not a replacement for it.
+
+- `make api-docs` renders a static Redoc site to `site/index.html` for local preview (open it directly in a browser).
+- `make api-docs-lint` lints the spec with `@redocly/cli`.
+- `make api-docs-check` runs the lint, the route-conformance drift test (`go test ./cmd/api/... -run TestOpenAPI`), and the render — the same checks `.github/workflows/api-docs.yml` runs on every PR. That workflow fails the build if the spec is invalid, or if it has drifted from the routes actually wired up in `newRouter`.
+- On every push to `main`, `.github/workflows/deploy-docs.yml` renders the spec and publishes it to GitHub Pages via `actions/deploy-pages`. **One-time repo setup required**: Settings → Pages → Build and deployment → Source = "GitHub Actions" (a workflow cannot toggle this setting itself).
+
 ## Documentation
 
 Contracts live in the master repo and are the source of truth:
