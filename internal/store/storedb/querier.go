@@ -305,9 +305,29 @@ type Querier interface {
 	//
 	// The lockout duration is base_duration_seconds doubled once per prior
 	// lockout (lockout_count, read BEFORE this attempt's own increment),
-	// capped at max_duration_seconds. @now is supplied by the caller (the
-	// service's injectable clock) rather than Postgres's own now(), so the
-	// lockout window is deterministic and testable under a fake clock.
+	// capped at max_duration_seconds. The doubling/capping arithmetic is done
+	// entirely in the seconds (float8) domain — LEAST() runs BEFORE the value
+	// is ever converted to an interval — because converting the uncapped
+	// doubled value to an interval first can overflow Postgres's interval
+	// range once lockout_count gets large (observed at lockout_count >= 34
+	// under concurrent-attempt bursts), which would make this UPDATE error
+	// out and turn a login into a 500 instead of the standard 401 envelope —
+	// itself a reachable no-oracle break.
+	//
+	// Both the lockout_count escalation and the locked_until assignment are
+	// additionally guarded on "not currently locked"
+	// (locked_until IS NULL OR locked_until <= @now): without this guard,
+	// concurrent failed attempts that all land after the row is already
+	// locked (each serialized in turn by this UPDATE's row lock, but each
+	// still satisfying "failed_login_attempts + 1 >= threshold" since the
+	// counter only grows) would each re-escalate lockout_count once per
+	// attempt rather than once per lockout episode, inflating the doubling
+	// exponent far faster than one escalation per actual lockout — which is
+	// exactly what fed the interval-overflow bug above.
+	//
+	// @now is supplied by the caller (the service's injectable clock) rather
+	// than Postgres's own now(), so the lockout window is deterministic and
+	// testable under a fake clock.
 	RecordFailedLoginAttempt(ctx context.Context, arg RecordFailedLoginAttemptParams) (User, error)
 	// Clears failed-attempt/lockout-escalation state on a successful login,
 	// per RIZ-59's reset semantics ("counter and lockout-escalation reset on

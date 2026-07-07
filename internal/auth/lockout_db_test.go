@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
+
 	"github.com/mirkru37/rize-backend/internal/auth"
 	"github.com/mirkru37/rize-backend/internal/store/storedb"
 )
@@ -69,11 +71,21 @@ func TestLogin_ConcurrentFailedAttempts_NoLostUpdates(t *testing.T) {
 }
 
 // TestLogin_ConcurrentFailedAttempts_LockoutEscalatesExactlyOnce asserts
-// that when concurrent failed logins push the attempt count across the
-// lockout threshold, exactly one lockout escalation happens (lockout_count
-// becomes 1, not more), even though multiple goroutines' UPDATEs may each
-// individually satisfy "failed_login_attempts + 1 >= threshold" as the
-// count climbs past it.
+// RIZ-59's post-review fix (MEDIUM finding): a 20-way concurrent burst of
+// failed logins against the same account — well past the lockout
+// threshold — must escalate lockout_count exactly ONCE per lockout
+// episode, not once per attempt that independently satisfies
+// "failed_login_attempts + 1 >= threshold" as the count climbs past it.
+// login_lockout.sql's RecordFailedLoginAttempt now additionally guards
+// both the lockout_count increment and the locked_until assignment on
+// "not currently locked" (locked_until IS NULL OR locked_until <= @now),
+// so once the row is locked, every other concurrent attempt in the same
+// burst (whose own @now is still well before locked_until) still
+// increments failed_login_attempts but does not re-escalate. Before this
+// fix, a burst like this could inflate lockout_count by roughly
+// (attempts - threshold + 1) in one go, which is what fed the HIGH
+// interval-overflow finding this PR also fixes (see
+// TestRecordFailedLoginAttempt_LockoutCountAboveOverflowThreshold).
 func TestLogin_ConcurrentFailedAttempts_LockoutEscalatesExactlyOnce(t *testing.T) {
 	pool := testDBPool(t)
 	const threshold = 5
@@ -86,7 +98,7 @@ func TestLogin_ConcurrentFailedAttempts_LockoutEscalatesExactlyOnce(t *testing.T
 		t.Fatalf("Register: %v", err)
 	}
 
-	const attempts = 20 // well past threshold; every attempt from the 5th onward would re-satisfy the threshold check if not for lockout_count only escalating relative to each attempt's own pre-increment reading
+	const attempts = 20 // well past threshold
 	var wg sync.WaitGroup
 	for i := 0; i < attempts; i++ {
 		wg.Add(1)
@@ -102,21 +114,77 @@ func TestLogin_ConcurrentFailedAttempts_LockoutEscalatesExactlyOnce(t *testing.T
 		t.Fatalf("GetUserByID: %v", err)
 	}
 	if int(user.FailedLoginAttempts) != attempts {
-		t.Fatalf("FailedLoginAttempts = %d, want %d", user.FailedLoginAttempts, attempts)
+		t.Fatalf("FailedLoginAttempts = %d, want %d (no lost updates)", user.FailedLoginAttempts, attempts)
 	}
-	// Every attempt at/after the threshold independently satisfies
-	// "failed_login_attempts + 1 >= threshold" (the count only grows), so
-	// lockout_count legitimately increments once per such attempt — this
-	// is the same "still failing after expiry re-locks and escalates"
-	// behavior TestLogin_EscalationDoubling exercises sequentially. What
-	// this test actually guards against is UNDER-counting from a lost
-	// update, not over-escalation: assert lockout_count matches exactly
-	// how many of the 20 attempts landed at/after the threshold.
-	wantLockouts := attempts - threshold + 1
-	if int(user.LockoutCount) != wantLockouts {
-		t.Errorf("LockoutCount = %d, want %d (attempts - threshold + 1, no lost updates)", user.LockoutCount, wantLockouts)
+	if user.LockoutCount != 1 {
+		t.Errorf("LockoutCount = %d, want exactly 1 (one escalation per lockout episode, not once per attempt past the threshold)", user.LockoutCount)
 	}
 	if !user.LockedUntil.Valid {
 		t.Errorf("LockedUntil not set after crossing the threshold")
+	}
+}
+
+// TestRecordFailedLoginAttempt_LockoutCountAboveOverflowThreshold is a
+// regression test for RIZ-59's post-review HIGH finding: doubling
+// base_duration_seconds by 2^lockout_count and converting straight to an
+// interval BEFORE capping at max_duration_seconds overflows Postgres's
+// interval range once lockout_count is large enough (observed at
+// lockout_count >= 34; 15m * 2^34 is on the order of hundreds of thousands
+// of years). That overflow made RecordFailedLoginAttempt return a
+// database error instead of a User row, which Login would have surfaced
+// as a 500 Internal Server Error instead of the standard 401
+// invalid-credentials envelope — itself a distinguishable signal (a
+// lockout oracle) on top of just being a bug. login_lockout.sql now caps
+// in the seconds (float8) domain before ever converting to an interval,
+// so this must succeed and simply return the account capped at
+// max_duration_seconds, no matter how large lockout_count has climbed.
+func TestRecordFailedLoginAttempt_LockoutCountAboveOverflowThreshold(t *testing.T) {
+	pool := testDBPool(t)
+	svc := newDBBackedLockoutTestService(t, pool, 10, 15*time.Minute, 24*time.Hour)
+	ctx := context.Background()
+
+	email := uniqueEmail("overflow-guard")
+	registered, err := svc.Register(ctx, email, "correct-horse-battery-staple", testDevice("Overflow's MacBook"))
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	// Force the row into a state that previously reproduced the overflow:
+	// lockout_count far above the ~34 threshold where base*2^lockout_count
+	// exceeds Postgres's interval range, with failed_login_attempts one
+	// short of the threshold so the next RecordFailedLoginAttempt call
+	// both increments across the threshold AND is not already locked (so
+	// the escalation branch actually runs).
+	const priorLockoutCount = 40
+	if _, err := pool.Exec(ctx,
+		`UPDATE users SET failed_login_attempts = 9, lockout_count = $2, locked_until = NULL WHERE id = $1`,
+		registered.User.ID, priorLockoutCount,
+	); err != nil {
+		t.Fatalf("seed lockout_count: %v", err)
+	}
+
+	now := time.Now()
+	user, err := svc.Queries.RecordFailedLoginAttempt(ctx, storedb.RecordFailedLoginAttemptParams{
+		ID:                  registered.User.ID,
+		Threshold:           10,
+		Now:                 pgtype.Timestamptz{Time: now, Valid: true},
+		BaseDurationSeconds: (15 * time.Minute).Seconds(),
+		MaxDurationSeconds:  (24 * time.Hour).Seconds(),
+	})
+	if err != nil {
+		t.Fatalf("RecordFailedLoginAttempt with lockout_count=%d: %v (this must not error — see the HIGH finding this test guards against)", priorLockoutCount, err)
+	}
+
+	if int(user.LockoutCount) != priorLockoutCount+1 {
+		t.Errorf("LockoutCount = %d, want %d", user.LockoutCount, priorLockoutCount+1)
+	}
+	if !user.LockedUntil.Valid {
+		t.Fatalf("LockedUntil not set")
+	}
+	gotDuration := user.LockedUntil.Time.Sub(now)
+	wantDuration := 24 * time.Hour
+	// Allow a small tolerance for the round trip through Postgres/pgx.
+	if diff := gotDuration - wantDuration; diff < -time.Second || diff > time.Second {
+		t.Errorf("locked_until - now = %v, want capped at %v", gotDuration, wantDuration)
 	}
 }

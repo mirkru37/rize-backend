@@ -16,25 +16,29 @@ UPDATE users
 SET
     failed_login_attempts = failed_login_attempts + 1,
     lockout_count = CASE
-        WHEN failed_login_attempts + 1 >= $1::int THEN lockout_count + 1
+        WHEN (locked_until IS NULL OR locked_until <= $1::timestamptz)
+            AND failed_login_attempts + 1 >= $2::int THEN lockout_count + 1
         ELSE lockout_count
     END,
     locked_until = CASE
-        WHEN failed_login_attempts + 1 >= $1::int THEN
-            $2::timestamptz + LEAST(
-                $3::float8 * power(2::float8, lockout_count::float8) * interval '1 second',
-                $4::float8 * interval '1 second'
+        WHEN (locked_until IS NULL OR locked_until <= $1::timestamptz)
+            AND failed_login_attempts + 1 >= $2::int THEN
+            $1::timestamptz + (
+                LEAST(
+                    $3::float8 * power(2::float8, lockout_count::float8),
+                    $4::float8
+                ) * interval '1 second'
             )
         ELSE locked_until
     END,
-    updated_at = $2::timestamptz
+    updated_at = $1::timestamptz
 WHERE id = $5 AND deleted_at IS NULL
 RETURNING id, email, password_hash, apple_user_id, display_name, role, timezone, created_at, updated_at, deleted_at, server_seq, failed_login_attempts, lockout_count, locked_until
 `
 
 type RecordFailedLoginAttemptParams struct {
-	Threshold           int32              `json:"threshold"`
 	Now                 pgtype.Timestamptz `json:"now"`
+	Threshold           int32              `json:"threshold"`
 	BaseDurationSeconds float64            `json:"base_duration_seconds"`
 	MaxDurationSeconds  float64            `json:"max_duration_seconds"`
 	ID                  pgtype.UUID        `json:"id"`
@@ -54,13 +58,33 @@ type RecordFailedLoginAttemptParams struct {
 //
 // The lockout duration is base_duration_seconds doubled once per prior
 // lockout (lockout_count, read BEFORE this attempt's own increment),
-// capped at max_duration_seconds. @now is supplied by the caller (the
-// service's injectable clock) rather than Postgres's own now(), so the
-// lockout window is deterministic and testable under a fake clock.
+// capped at max_duration_seconds. The doubling/capping arithmetic is done
+// entirely in the seconds (float8) domain — LEAST() runs BEFORE the value
+// is ever converted to an interval — because converting the uncapped
+// doubled value to an interval first can overflow Postgres's interval
+// range once lockout_count gets large (observed at lockout_count >= 34
+// under concurrent-attempt bursts), which would make this UPDATE error
+// out and turn a login into a 500 instead of the standard 401 envelope —
+// itself a reachable no-oracle break.
+//
+// Both the lockout_count escalation and the locked_until assignment are
+// additionally guarded on "not currently locked"
+// (locked_until IS NULL OR locked_until <= @now): without this guard,
+// concurrent failed attempts that all land after the row is already
+// locked (each serialized in turn by this UPDATE's row lock, but each
+// still satisfying "failed_login_attempts + 1 >= threshold" since the
+// counter only grows) would each re-escalate lockout_count once per
+// attempt rather than once per lockout episode, inflating the doubling
+// exponent far faster than one escalation per actual lockout — which is
+// exactly what fed the interval-overflow bug above.
+//
+// @now is supplied by the caller (the service's injectable clock) rather
+// than Postgres's own now(), so the lockout window is deterministic and
+// testable under a fake clock.
 func (q *Queries) RecordFailedLoginAttempt(ctx context.Context, arg RecordFailedLoginAttemptParams) (User, error) {
 	row := q.db.QueryRow(ctx, recordFailedLoginAttempt,
-		arg.Threshold,
 		arg.Now,
+		arg.Threshold,
 		arg.BaseDurationSeconds,
 		arg.MaxDurationSeconds,
 		arg.ID,

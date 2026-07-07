@@ -612,7 +612,13 @@ func (f *fakeQuerier) RecordFailedLoginAttempt(_ context.Context, arg storedb.Re
 	}
 
 	u.FailedLoginAttempts++
-	if u.FailedLoginAttempts >= arg.Threshold {
+	notCurrentlyLocked := !u.LockedUntil.Valid || !u.LockedUntil.Time.After(arg.Now.Time)
+	if notCurrentlyLocked && u.FailedLoginAttempts >= arg.Threshold {
+		// Guarded on "not currently locked" to mirror login_lockout.sql's
+		// fix (RIZ-59 review, MEDIUM finding): without this guard,
+		// concurrent failed attempts landing after the row is already
+		// locked would each re-escalate lockout_count once per attempt
+		// instead of once per lockout episode.
 		duration := arg.BaseDurationSeconds * math.Pow(2, float64(u.LockoutCount))
 		if duration > arg.MaxDurationSeconds {
 			duration = arg.MaxDurationSeconds
