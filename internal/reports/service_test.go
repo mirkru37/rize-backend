@@ -53,14 +53,15 @@ func testDBPool(t *testing.T) *pgxpool.Pool {
 // refreshCaggs forces an immediate materialization of the three
 // continuous aggregates this package reads from, per
 // documentation/database-schema.md's Continuous Aggregates section.
-// migrations 000016-000018 create these caggs with materialized_only=true
-// (Timescale's current default for newly-created continuous aggregates),
-// so newly-inserted rows for a "closed" period are only reflected once a
-// refresh runs — normally driven by migration 000019's
-// add_continuous_aggregate_policy schedules. Tests call this against the
-// same pool used to seed data, to deterministically simulate "the
-// aggregate has since caught up" rather than waiting on that background
-// schedule.
+// Migration 000029 recreated these caggs with
+// timescaledb.materialized_only = false (RIZ-74), so a query against them
+// already unions materialized data with a real-time read over the
+// not-yet-materialized tail of activity_events — a manual refresh is no
+// longer required for a closed period's totals to be correct. Tests still
+// call this where they specifically want to assert against the
+// materialized state (e.g. as a baseline before proving the real-time path
+// picks up a later insert), rather than waiting on
+// add_continuous_aggregate_policy's background schedule.
 func refreshCaggs(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 	ctx := context.Background()
@@ -69,6 +70,40 @@ func refreshCaggs(t *testing.T, pool *pgxpool.Pool) {
 			t.Fatalf("refresh_continuous_aggregate(%s): %v", view, err)
 		}
 	}
+}
+
+// futureDayBeyondWatermark returns a UTC day start guaranteed to be after
+// TimescaleDB's current cross-cagg materialization watermark (see
+// TestCategoryTotalsForRangeReflectsRealTimeDataWithNoRefresh's doc
+// comment for why a fixed offset from "now" is not safe here): it reads
+// _timescaledb_catalog.continuous_aggs_invalidation_threshold directly and
+// picks whichever is later, "5 years from now" or "the day after the
+// current watermark" — the watermark is -infinity (a very large negative
+// microsecond count) on a freshly migrated database, in which case "5
+// years from now" always wins.
+func futureDayBeyondWatermark(t *testing.T, pool *pgxpool.Pool) time.Time {
+	t.Helper()
+	ctx := context.Background()
+
+	future := time.Now().UTC().AddDate(5, 0, 0)
+	candidate := time.Date(future.Year(), future.Month(), future.Day(), 0, 0, 0, 0, time.UTC)
+
+	var watermarkMicros int64
+	err := pool.QueryRow(ctx,
+		"select coalesce(max(watermark), 0) from _timescaledb_catalog.continuous_aggs_invalidation_threshold",
+	).Scan(&watermarkMicros)
+	if err != nil {
+		t.Fatalf("reading continuous_aggs_invalidation_threshold: %v", err)
+	}
+	if watermarkMicros == 0 {
+		return candidate
+	}
+	watermark := time.UnixMicro(watermarkMicros).UTC()
+	if watermark.Before(candidate) {
+		return candidate
+	}
+	day := time.Date(watermark.Year(), watermark.Month(), watermark.Day(), 0, 0, 0, 0, time.UTC)
+	return day.AddDate(0, 0, 1)
 }
 
 func textPtr(s string) *string { return &s }
@@ -497,6 +532,169 @@ func TestCategoriesInvalidPrecisionRejected(t *testing.T) {
 	_, err := svc.Categories(context.Background(), user.ID.String(), from, from.AddDate(0, 0, 1), reportFilters{Precision: "bogus"})
 	if err == nil {
 		t.Fatalf("expected an error for an invalid precision filter")
+	}
+}
+
+// TestCategoriesClosedDaySameDeviceOverlapCappedMatchesRaw is a regression
+// test (RIZ-74, PR #9 review follow-up): before migration 000029 added a
+// device_id dimension to daily_category_totals, the closed-period cagg
+// path summed duration_s with no way to cap same-device overlap, so it
+// could double-count overlapping same-device activity_events rows that the
+// raw/open-period path already caps (documentation/sync-protocol.md
+// §Overlap Rules; internal/reports/trim.go). Two identical full-day
+// events on the same device push the naive sum to double the day's
+// length, entirely inside one closed day, which both exercises the cagg
+// path's per-device window cap (internal/store/queries/activities.sql's
+// CategoryTotalsForRange) and lands on the exact value the raw path's
+// interval merge also produces for two fully-overlapping intervals — the
+// window cap and the raw merge necessarily agree whenever the merged
+// union spans the whole window, letting this assert the two paths give
+// the identical, non-double-counted total.
+func TestCategoriesClosedDaySameDeviceOverlapCappedMatchesRaw(t *testing.T) {
+	pool := testDBPool(t)
+	q := storedb.New(pool)
+	user, deviceA, _ := newUserAndDevices(t, q)
+	cat := newCategory(t, q, user.ID, "Development")
+
+	day := pastDay(12)
+	// Two identical full-day-spanning events on the SAME device: the
+	// naive sum (2 * 24h = 48h) would double-count the day, but the
+	// merged/capped coverage is exactly the day's own 24h.
+	insertEvent(t, q, user.ID, deviceA.ID, day, day.AddDate(0, 0, 1), eventOpts{CategoryID: cat.ID})
+	insertEvent(t, q, user.ID, deviceA.ID, day, day.AddDate(0, 0, 1), eventOpts{CategoryID: cat.ID})
+	refreshCaggs(t, pool)
+
+	svc := &Service{Queries: q}
+
+	caggResult, err := svc.Categories(context.Background(), user.ID.String(), day, day.AddDate(0, 0, 1), reportFilters{})
+	if err != nil {
+		t.Fatalf("Categories (cagg path): %v", err)
+	}
+	var caggTotal int64
+	for _, c := range caggResult.Categories {
+		caggTotal += c.Seconds
+	}
+
+	// A precision filter is incompatible with the cagg fast path, forcing
+	// categoryTotals to fall back to rawTotals for the whole range.
+	rawResult, err := svc.Categories(context.Background(), user.ID.String(), day, day.AddDate(0, 0, 1), reportFilters{Precision: "exact"})
+	if err != nil {
+		t.Fatalf("Categories (raw path): %v", err)
+	}
+	var rawTotal int64
+	for _, c := range rawResult.Categories {
+		rawTotal += c.Seconds
+	}
+
+	const wantMerged = 24 * 60 * 60
+	if caggTotal != wantMerged {
+		t.Errorf("cagg-path total seconds = %d, want %d (same-device overlap must be capped, not summed)", caggTotal, wantMerged)
+	}
+	if rawTotal != wantMerged {
+		t.Errorf("raw-path total seconds = %d, want %d (same-device overlap must be merged, not summed)", rawTotal, wantMerged)
+	}
+	if caggTotal != rawTotal {
+		t.Errorf("cagg-path total (%d) and raw-path total (%d) disagree; closed-period trim must match the raw path", caggTotal, rawTotal)
+	}
+}
+
+// TestReportCaggsAreConfiguredMaterializedOnlyFalse is a schema-level check
+// (RIZ-74, PR #9 review follow-up) that migrations 000033-000035 actually
+// left daily_app_totals, daily_category_totals, and hourly_category_totals
+// configured as real-time (materialized_only = false) continuous
+// aggregates, per documentation/architecture-backend.md §Aggregation
+// Strategy's anticipated fix.
+func TestReportCaggsAreConfiguredMaterializedOnlyFalse(t *testing.T) {
+	pool := testDBPool(t)
+	ctx := context.Background()
+
+	for _, view := range []string{"daily_app_totals", "daily_category_totals", "hourly_category_totals"} {
+		var materializedOnly bool
+		err := pool.QueryRow(ctx,
+			"select materialized_only from timescaledb_information.continuous_aggregates where view_name = $1", view,
+		).Scan(&materializedOnly)
+		if err != nil {
+			t.Fatalf("querying materialized_only for %s: %v", view, err)
+		}
+		if materializedOnly {
+			t.Errorf("%s: materialized_only = true, want false (migrations 000033-000035)", view)
+		}
+	}
+}
+
+// TestCategoryTotalsForRangeReflectsRealTimeDataWithNoRefresh is a
+// real-time-aggregation proof (RIZ-74, PR #9 review follow-up): migration
+// 000034 recreated daily_category_totals with timescaledb.materialized_only
+// = false, so a query against it unions materialized data with a live read
+// over not-yet-materialized activity_events rows, rather than a plain
+// materialized_only = true view (the pre-RIZ-74 shape), which would return
+// nothing for a bucket it has never refreshed.
+//
+// This deliberately uses a window in the future rather than "yesterday" or
+// "today". TimescaleDB's materialization watermark is a single value
+// shared by every continuous aggregate on the activity_events hypertable,
+// and a full (NULL, NULL) refresh_continuous_aggregate call — several
+// other tests in this package deliberately make one, to establish a
+// materialized baseline for their own assertions — advances it to (one
+// bucket past) the highest started_at value that exists in the hypertable
+// at the time of that call, and it never moves backward. That includes
+// "today": the first such call any earlier test makes, in the same
+// process, against data that already spans up to "now", pushes the
+// watermark to tomorrow's bucket boundary, which would freeze today's
+// bucket for the rest of the process — so testing this via "today" or a
+// recent past day is order-dependent on which other tests in this process
+// happen to refresh first. Every other test in this package only ever
+// inserts past-or-present timestamps, so a window far enough in the
+// future can never be behind a watermark any of them could have produced.
+//
+// futureDayBeyondWatermark below also reads the watermark directly and
+// picks a day strictly after it, rather than a fixed offset from "now":
+// a fixed offset would eventually self-poison across repeated `go test`
+// invocations against the same never-recreated local dev database — an
+// unrelated test's later refresh would pick up this test's own previous
+// leftover future row as its new "highest timestamp" and advance the
+// watermark to match it, so a second local run choosing the exact same
+// day would then find itself behind the (now-advanced) watermark too.
+// Reading the watermark first makes this test correct both on a freshly
+// migrated database (CI, and this ticket's Definition of Done) and across
+// any number of repeated local runs against the same database.
+//
+// This calls CategoryTotalsForRange directly (bypassing Service.Categories)
+// specifically because splitClosedOpen always treats a from/to range at or
+// after "today" as open, routing it to the raw pass — so exercising this
+// query with a future window requires bypassing that routing, not because
+// the cagg-path routing itself is in question.
+func TestCategoryTotalsForRangeReflectsRealTimeDataWithNoRefresh(t *testing.T) {
+	pool := testDBPool(t)
+	q := storedb.New(pool)
+	user, deviceA, _ := newUserAndDevices(t, q)
+	cat := newCategory(t, q, user.ID, "Development")
+
+	from := futureDayBeyondWatermark(t, pool)
+	to := from.AddDate(0, 0, 1)
+	insertEvent(t, q, user.ID, deviceA.ID, from.Add(9*time.Hour), from.Add(9*time.Hour+20*time.Minute), eventOpts{CategoryID: cat.ID})
+
+	// No refresh_continuous_aggregate call anywhere in this test: nothing
+	// this far in the future could ever have been materialized by any
+	// refresh, by any test, so a non-empty result here can only come from
+	// the real-time read path.
+	rows, err := q.CategoryTotalsForRange(context.Background(), storedb.CategoryTotalsForRangeParams{
+		UserID:        user.ID,
+		FromDay:       pgTimestamptz(from),
+		ToDay:         pgTimestamptz(to),
+		WindowSeconds: int64(to.Sub(from).Seconds()),
+	})
+	if err != nil {
+		t.Fatalf("CategoryTotalsForRange: %v", err)
+	}
+
+	var total int64
+	for _, r := range rows {
+		total += r.TotalS
+	}
+	const want = 20 * 60
+	if total != want {
+		t.Errorf("total seconds = %d, want %d (real-time aggregation must include a row that has never been materialized)", total, want)
 	}
 }
 
