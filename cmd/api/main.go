@@ -26,6 +26,7 @@ import (
 	"github.com/mirkru37/rize-backend/internal/focussessions"
 	"github.com/mirkru37/rize-backend/internal/httpx"
 	appmw "github.com/mirkru37/rize-backend/internal/middleware"
+	"github.com/mirkru37/rize-backend/internal/observability"
 	"github.com/mirkru37/rize-backend/internal/projects"
 	"github.com/mirkru37/rize-backend/internal/reports"
 	"github.com/mirkru37/rize-backend/internal/store"
@@ -33,6 +34,14 @@ import (
 	"github.com/mirkru37/rize-backend/internal/sync"
 	"github.com/mirkru37/rize-backend/internal/tags"
 )
+
+// sentryFlushTimeout bounds how long process shutdown waits for
+// already-buffered Sentry events to be delivered, per RIZ-53 /
+// documentation/observability.md. It intentionally does not scale with
+// cfg.ShutdownTimeout: event delivery is a best-effort side channel, not
+// part of graceful in-flight-request draining, so it gets its own short,
+// fixed budget instead of competing with that timeout.
+const sentryFlushTimeout = 2 * time.Second
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -44,8 +53,28 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := run(logger, cfg); err != nil {
-		logger.Error("server exited with error", "error", err)
+	// RIZ-53 / documentation/observability.md: initializing with an empty
+	// SentryDSN (the local-dev/default value) cleanly disables Sentry —
+	// see internal/observability.Init — so this call is unconditional. A
+	// non-empty but malformed DSN is a misconfiguration we log and run
+	// degraded through, rather than treat as fatal: error tracking being
+	// unavailable must never take the whole service down with it.
+	if err := observability.Init(observability.Config{
+		DSN:         cfg.SentryDSN,
+		Environment: cfg.Environment,
+		Release:     cfg.SentryRelease,
+	}); err != nil {
+		logger.Error("failed to initialize Sentry", "error", err)
+	}
+	runErr := run(logger, cfg)
+
+	// Flush before exiting on either path: os.Exit below would otherwise
+	// skip a deferred flush, dropping any event (e.g. the panic/error that
+	// caused runErr) buffered since the last delivery.
+	observability.Flush(sentryFlushTimeout)
+
+	if runErr != nil {
+		logger.Error("server exited with error", "error", runErr)
 		os.Exit(1)
 	}
 }
