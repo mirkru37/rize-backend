@@ -317,6 +317,22 @@ func (f *fakeQuerier) ListChangelogPage(context.Context, storedb.ListChangelogPa
 	return nil, errNotImplementedByFakeQuerier
 }
 
+func (f *fakeQuerier) SelectChangelogPruneBatch(context.Context, storedb.SelectChangelogPruneBatchParams) ([]storedb.SelectChangelogPruneBatchRow, error) {
+	return nil, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) DeleteChangelogRows(context.Context, []int64) (int64, error) {
+	return 0, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) AdvanceChangelogHorizon(context.Context, storedb.AdvanceChangelogHorizonParams) (storedb.AdvanceChangelogHorizonRow, error) {
+	return storedb.AdvanceChangelogHorizonRow{}, errNotImplementedByFakeQuerier
+}
+
+func (f *fakeQuerier) GetChangelogHorizon(context.Context) (storedb.GetChangelogHorizonRow, error) {
+	return storedb.GetChangelogHorizonRow{}, errNotImplementedByFakeQuerier
+}
+
 func (f *fakeQuerier) GetActivityEventForChangelogEntry(context.Context, storedb.GetActivityEventForChangelogEntryParams) (storedb.GetActivityEventForChangelogEntryRow, error) {
 	return storedb.GetActivityEventForChangelogEntryRow{}, errNotImplementedByFakeQuerier
 }

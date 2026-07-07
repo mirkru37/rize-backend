@@ -96,6 +96,18 @@ func writeServiceError(w http.ResponseWriter, r *http.Request, err error) {
 	case errors.Is(err, ErrDeviceNotFound):
 		httpx.WriteError(w, r, http.StatusForbidden, errNS+"device-not-found", "Device Not Found",
 			"device_id does not resolve to a device owned by the authenticated user.")
+	case errors.Is(err, ErrCursorExpired):
+		// 410 Gone: the supplied cursor's position has been pruned from
+		// sync_changelog by RIZ-72's age-based retention and can no longer
+		// be resumed from. Per documentation/sync-protocol.md §Device
+		// Restore from Backup, the client's documented recovery is to
+		// reset its cursor to empty and re-pull from the beginning — safe
+		// because pulls are idempotent. Gone (rather than a 4xx the client
+		// might blindly retry unchanged) signals that this exact cursor
+		// value can never succeed again, so the client must supply a
+		// different one (empty) rather than retrying as-is.
+		httpx.WriteError(w, r, http.StatusGone, errNS+"cursor-expired", "Cursor Expired",
+			"The supplied cursor is older than this server's retained change history. Reset your cursor to empty and re-pull from the beginning; pulls are idempotent so this is always safe.")
 	case errors.Is(err, ErrValidation):
 		httpx.WriteError(w, r, http.StatusBadRequest, errNS+"validation-error", "Validation Error", err.Error())
 	default:

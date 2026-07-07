@@ -49,6 +49,18 @@ cp .env.example .env
 - **Running the binary on the host** (`go run ./cmd/api`): the process does not auto-load `.env` (no dotenv library is wired in), so export the variables into your shell first, e.g. `set -a && source .env && set +a`.
 - **`docker compose up`**: the `api` service reads `.env` if present, via `env_file: { path: .env, required: false }` — so `JWT_SIGNING_KEY`, `CORS_ALLOWED_ORIGINS`, and other variables from a copied `.env` are picked up by compose. `PORT` and `DATABASE_URL` are still set explicitly in the `environment:` block, and compose gives `environment:` precedence over `env_file:`, so those two stay compose-overridden by design — the container needs `PORT=8080` and the container-network `DATABASE_URL` (host `db`), not a localhost DSN from a host-oriented `.env`.
 
+## Sync changelog retention (RIZ-72)
+
+`sync_changelog` (the append-only outbox `GET /v1/sync/changes` paginates — see [Sync protocol](../documentation/sync-protocol.md)) is pruned automatically by an in-process background job (`internal/sync.Pruner`, started as a ticker goroutine in `cmd/api/main.go`), not by any request-path code:
+
+- Rows older than `SYNC_CHANGELOG_MAX_AGE` (hours; default 2160 = 90 days) are eligible for deletion. 90 days comfortably bounds the commit-ordered pull cursor's xid8 wraparound-safety window (migrations `000024`/`000025`) while giving a long-dormant device's stale local cursor a generous grace period.
+- The pruner wakes up every `SYNC_CHANGELOG_PRUNE_INTERVAL_SECONDS` (default 3600) and deletes at most `SYNC_CHANGELOG_PRUNE_BATCH_SIZE` (default 5000) rows per tick, so one tick never holds a long-running transaction.
+- Each prune batch's furthest `(xid8, server_seq)` position is recorded in the single-row `sync_changelog_horizon` table (migration `000029`), transactionally with the delete that produced it (select + delete + horizon-advance all happen in one database transaction — see `Pruner.PruneOnce`'s doc comment for why that's what makes it atomic).
+- `GET /v1/sync/changes` checks a non-empty caller cursor against that horizon before serving a page: a cursor strictly below the horizon can no longer be served a gap-free page (the rows between it and the horizon were pruned) and the request fails with `410 Gone` (`cursor-expired`) instead of silently skipping changes. Per [Sync protocol](../documentation/sync-protocol.md)'s Device Restore from Backup recovery path, the correct client response is to reset the cursor to empty and re-pull from the beginning — always safe, since pulls are idempotent. A first-ever pull (empty cursor) is never affected.
+- Device-level cursor tracking (the `sync_cursors` table) is intentionally untouched by this feature — see backlog ticket RIZ-78.
+
+See `internal/sync/retention.go` for the concurrency-safety argument (why a prune can never strand an already-in-flight pull) and `internal/sync/retention_test.go` for the covering tests.
+
 ## Documentation
 
 Contracts live in the master repo and are the source of truth:

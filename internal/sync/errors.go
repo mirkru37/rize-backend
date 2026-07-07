@@ -25,4 +25,18 @@ var (
 	// reported as a per-item "invalid" result rather than failing the
 	// request).
 	ErrValidation = errors.New("sync: validation error")
+
+	// ErrCursorExpired is returned by Service.pull (RIZ-72) when the
+	// caller-supplied cursor is strictly below the persisted
+	// sync_changelog retention horizon: the rows between that cursor and
+	// the horizon have been pruned by age-based retention, so this page
+	// can no longer be served without silently skipping changes. Per
+	// documentation/sync-protocol.md §Device Restore from Backup, a client
+	// that resets its cursor to empty and re-pulls from the beginning is
+	// always safe (pulls are idempotent) — so the caller is told to do
+	// exactly that, the same recovery path already defined for a lost or
+	// stale local cursor, rather than being handed a page with an
+	// undetectable gap in it. A first-ever pull (empty/zero cursor) never
+	// triggers this: see store.PullCursor.IsZero.
+	ErrCursorExpired = errors.New("sync: cursor expired, reset and re-pull from the beginning")
 )

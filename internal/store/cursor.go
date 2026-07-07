@@ -60,6 +60,28 @@ type PullCursor struct {
 	ServerSeq int64
 }
 
+// IsZero reports whether c is the zero PullCursor (the beginning of the
+// change stream — see this type's doc comment). Used by RIZ-72's
+// cursor-reset check (internal/sync/pull.go) to exempt a first-ever pull
+// (empty cursor) from ever being compared against the retained horizon:
+// "from the beginning" is always servable, by construction, since a prune
+// only ever deletes rows, never rewrites the start of the stream.
+func (c PullCursor) IsZero() bool {
+	return c.Xid8 == 0 && c.ServerSeq == 0
+}
+
+// Less reports whether c sorts strictly before other in the same
+// (xid8, server_seq) keyset order migration 000025's gap-free-by-construction
+// invariant relies on (see ListChangelogPage's ORDER BY). Used by RIZ-72's
+// cursor-reset check to compare a caller's cursor against the persisted
+// prune horizon.
+func (c PullCursor) Less(other PullCursor) bool {
+	if c.Xid8 != other.Xid8 {
+		return c.Xid8 < other.Xid8
+	}
+	return c.ServerSeq < other.ServerSeq
+}
+
 // EncodePullCursor turns a PullCursor into the opaque cursor token
 // documentation/api-reference.md §Conventions and
 // documentation/sync-protocol.md §Pull describe ("cursor is an opaque

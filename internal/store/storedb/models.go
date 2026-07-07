@@ -152,6 +152,16 @@ type SyncChangelog struct {
 	EntityID       pgtype.UUID        `json:"entity_id"`
 	EventStartedAt pgtype.Timestamptz `json:"event_started_at"`
 	ServerSeq      int64              `json:"server_seq"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+}
+
+// RIZ-72: single-row watermark recording the furthest (xid8, server_seq) position pruned from sync_changelog so far. A pull cursor strictly below this position can no longer be served a gap-free page (the rows between it and here were deleted by age-based retention) and must be told to reset instead of silently skipping ahead.
+type SyncChangelogHorizon struct {
+	ID               bool               `json:"id"`
+	HorizonXid8      pgtype.Uint64      `json:"horizon_xid8"`
+	HorizonServerSeq int64              `json:"horizon_server_seq"`
+	PrunedAt         pgtype.Timestamptz `json:"pruned_at"`
+	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
 }
 
 type SyncCursor struct {
