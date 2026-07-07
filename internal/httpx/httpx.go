@@ -14,6 +14,8 @@ import (
 	"net/http"
 
 	"github.com/go-chi/chi/v5/middleware"
+
+	"github.com/mirkru37/rize-backend/internal/observability"
 )
 
 // RequestIDHeader is the response header used to echo the request ID back
@@ -46,8 +48,13 @@ func WriteJSON(w http.ResponseWriter, r *http.Request, status int, payload any) 
 
 // WriteError writes an RFC 7807-style problem-body error response,
 // echoing the request ID (if present in the request context) via the
-// X-Request-Id response header.
+// X-Request-Id response header. 5xx responses are additionally reported
+// to Sentry (RIZ-53 / documentation/observability.md); 4xx client errors
+// are never reported — see internal/observability.CaptureHTTPError.
 func WriteError(w http.ResponseWriter, r *http.Request, status int, errType, title, detail string) {
+	if r != nil {
+		observability.CaptureHTTPError(r.Context(), status, errType, title, detail)
+	}
 	echoRequestID(w, r)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)

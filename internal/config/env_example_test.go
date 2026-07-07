@@ -27,6 +27,11 @@ var envKeyPattern = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
 // would instead be fed to LoadSigningKey and fail to parse as PEM.
 var optionalInExample = map[string]bool{
 	"JWT_SIGNING_KEY": true,
+	// SENTRY_DSN and SENTRY_RELEASE (RIZ-53) must stay unset by default in
+	// a freshly copied .env: that's what routes local dev onto Sentry's
+	// disabled/no-op path (see internal/observability.Init).
+	"SENTRY_DSN":     true,
+	"SENTRY_RELEASE": true,
 }
 
 // TestEnvExampleListsAllConfigVars enforces that .env.example documents

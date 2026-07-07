@@ -111,6 +111,8 @@ var EnvVarNames = []string{
 	"SYNC_CHANGELOG_MAX_AGE",
 	"SYNC_CHANGELOG_PRUNE_INTERVAL_SECONDS",
 	"SYNC_CHANGELOG_PRUNE_BATCH_SIZE",
+	"SENTRY_DSN",
+	"SENTRY_RELEASE",
 }
 
 // Config holds rize-backend's runtime configuration, loaded from
@@ -196,6 +198,23 @@ type Config struct {
 	// SyncChangelogPruneBatchSize bounds how many sync_changelog rows one
 	// prune tick deletes.
 	SyncChangelogPruneBatchSize int
+
+	// SentryDSN is the Sentry project DSN (RIZ-53 /
+	// documentation/observability.md). Left empty, Sentry error tracking
+	// is cleanly disabled — the local-dev/default path; see
+	// internal/observability.Init. DSNs are client-visible identifiers,
+	// not secrets (documentation/observability.md §Privacy rules), but
+	// still live in environment configuration rather than source.
+	SentryDSN string
+	// SentryRelease tags every Sentry event with the deployed release,
+	// per documentation/observability.md ("Every event carries
+	// environment and release tags"). This repo has no existing
+	// ldflags-injected build-version pattern to follow (checked: no
+	// other package defines one), so SENTRY_RELEASE is a plain
+	// environment variable populated by the deploy pipeline (e.g. the
+	// image tag or commit SHA) rather than a compile-time-injected
+	// constant. Empty is valid — Sentry simply omits the release tag.
+	SentryRelease string
 }
 
 // Load builds a Config from environment variables, applying defaults for
@@ -220,6 +239,8 @@ func Load() (Config, error) {
 		SyncChangelogMaxAge:         time.Duration(DefaultSyncChangelogMaxAgeHours) * time.Hour,
 		SyncChangelogPruneInterval:  time.Duration(DefaultSyncChangelogPruneIntervalSeconds) * time.Second,
 		SyncChangelogPruneBatchSize: DefaultSyncChangelogPruneBatchSize,
+		SentryDSN:                   os.Getenv("SENTRY_DSN"),
+		SentryRelease:               os.Getenv("SENTRY_RELEASE"),
 	}
 
 	if v := os.Getenv("RATE_LIMIT_REQUESTS_PER_MINUTE"); v != "" {
