@@ -1,0 +1,75 @@
+# Deploy-time compose file for rize-backend (RIZ-75).
+#
+# This is the full stack (api + TimescaleDB + one-shot migrate) run on a
+# single GCE VM per environment (integration, production) — see
+# docs/deployment.md for the full architecture. It is deliberately separate
+# from the repo-root docker-compose.yml, which is for local development
+# (builds images from source, uses hardcoded local credentials). This file
+# instead pulls pre-built images from Artifact Registry (API_IMAGE /
+# MIGRATE_IMAGE, tagged per commit by CI) and reads every other runtime
+# value from a sibling `.env` file rendered by the deploy workflow from that
+# environment's GitHub Environment vars/secrets — see
+# .github/workflows/deploy-integration.yml and deploy-production.yml.
+#
+# Deploy step on the VM (see the workflows):
+#   docker compose -f docker-compose.yml --env-file .env pull
+#   docker compose -f docker-compose.yml --env-file .env run --rm migrate
+#   docker compose -f docker-compose.yml --env-file .env up -d api
+#
+# TimescaleDB data lives on the named volume `timescaledb-data`, which is
+# NOT recreated by a redeploy (only removed by an explicit `docker compose
+# down -v` or `docker volume rm`), so re-running this compose file on
+# subsequent deploys preserves the database across releases.
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: rize
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: rize
+    volumes:
+      - timescaledb-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rize -d rize"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # One-shot migration run, per the same migration-before-deploy ordering
+  # the previous Cloud Run Job-based flow used (see docs/deployment.md).
+  # `docker compose run --rm migrate` starts this and its `timescaledb`
+  # dependency, waits for completion, and removes the container; it is
+  # never started by `docker compose up`.
+  migrate:
+    image: ${MIGRATE_IMAGE}
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+    restart: "no"
+
+  api:
+    image: ${API_IMAGE}
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      ENVIRONMENT: ${ENVIRONMENT}
+      DATABASE_URL: ${DATABASE_URL}
+      JWT_SIGNING_KEY: ${JWT_SIGNING_KEY}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  timescaledb-data:

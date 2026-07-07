@@ -15,13 +15,13 @@ permissions:
 
 env:
   AR_REPO: rize-backend
-  API_JOB_ENVIRONMENT: staging # see internal/config: valid ENVIRONMENT values are development, staging, production — there is no literal "integration" value.
+  API_ENVIRONMENT: staging # see internal/config: valid ENVIRONMENT values are development, staging, production — there is no literal "integration" value.
 
 jobs:
   # Guard job: runs unconditionally and first. If the repo has not been
   # GCP-bootstrapped yet (no GCP_PROJECT_ID secret), it logs a clear message
-  # and exits 0 so pushes to main never fail CI pre-bootstrap. All later jobs
-  # are gated on its `configured` output.
+  # and exits 0 so pushes to main never fail CI pre-bootstrap. All later
+  # jobs are gated on its `configured` output.
   guard:
     name: Guard - GCP bootstrap check
     runs-on: ubuntu-latest
@@ -89,13 +89,16 @@ jobs:
       - name: Push migration image
         run: docker push --all-tags "${{ steps.vars.outputs.migrate-image }}"
 
-  migrate:
-    name: Run integration DB migrations
+  deploy:
+    name: Deploy full stack to GCE
     needs: [guard, build-and-push]
     if: needs.guard.outputs.configured == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    environment: integration
     steps:
+      - uses: actions/checkout@v4
+
       - id: auth
         name: Authenticate to Google Cloud (Workload Identity Federation)
         uses: google-github-actions/auth@v2
@@ -108,51 +111,91 @@ jobs:
         with:
           project_id: ${{ secrets.GCP_PROJECT_ID }}
 
-      - name: Deploy migration Cloud Run Job
+      - name: Verify the integration VM exists
         run: |
-          gcloud run jobs deploy rize-backend-migrate-integration \
-            --image="${{ needs.build-and-push.outputs.migrate-image }}:${{ github.sha }}" \
-            --region="${{ secrets.GCP_REGION }}" \
-            --project="${{ secrets.GCP_PROJECT_ID }}" \
-            --service-account="rize-backend-runtime@${{ secrets.GCP_PROJECT_ID }}.iam.gserviceaccount.com" \
-            --set-secrets="DATABASE_URL=${{ secrets.INTEGRATION_DATABASE_URL_SECRET }}" \
-            --quiet
+          if ! gcloud compute instances describe "${{ vars.GCE_INSTANCE }}" \
+              --zone="${{ vars.GCE_ZONE }}" \
+              --project="${{ secrets.GCP_PROJECT_ID }}" &>/dev/null; then
+            echo "::error::VM '${{ vars.GCE_INSTANCE }}' not found in zone '${{ vars.GCE_ZONE }}' (project ${{ secrets.GCP_PROJECT_ID }}). Run deploy/bootstrap-gce.sh (ENVIRONMENT=integration) to create it first — see docs/deployment.md."
+            exit 1
+          fi
 
-      - name: Execute migration job and wait for completion
+      # .env is rendered from this environment's GitHub Environment
+      # vars/secrets via a heredoc (never echoed to the log) and scp'd to
+      # the VM alongside the in-repo deploy compose file. DATABASE_URL is
+      # taken directly from the DATABASE_URL secret if the environment set
+      # one, otherwise built from POSTGRES_PASSWORD against the in-stack
+      # timescaledb service.
+      - name: Render deploy .env
+        env:
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          DATABASE_URL_SECRET: ${{ secrets.DATABASE_URL }}
+          JWT_SIGNING_KEY: ${{ secrets.JWT_SIGNING_KEY }}
+          CORS_ALLOWED_ORIGINS: ${{ vars.CORS_ALLOWED_ORIGINS }}
+          API_IMAGE: ${{ needs.build-and-push.outputs.api-image }}
+          MIGRATE_IMAGE: ${{ needs.build-and-push.outputs.migrate-image }}
         run: |
-          gcloud run jobs execute rize-backend-migrate-integration \
-            --region="${{ secrets.GCP_REGION }}" \
-            --project="${{ secrets.GCP_PROJECT_ID }}" \
-            --wait
+          set +x
+          DATABASE_URL="${DATABASE_URL_SECRET:-postgres://rize:${POSTGRES_PASSWORD}@timescaledb:5432/rize?sslmode=disable}"
+          IMAGE_SHA="${{ github.sha }}"
+          # The heredoc body below is indented to match this workflow file's
+          # YAML nesting; the trailing `sed` strips that leading whitespace
+          # so deploy.env ends up with flush-left KEY=VALUE lines. Nothing
+          # here is echoed to the log (no `set -x`, no `cat`/`echo` of the
+          # rendered values elsewhere).
+          # Every value is double-quoted so a multi-line JWT_SIGNING_KEY (a
+          # PEM-encoded key, per internal/config's doc comment) round-trips
+          # through the .env file intact — docker compose's dotenv parser
+          # supports quoted multi-line values.
+          cat <<DEPLOYENV | sed 's/^[[:space:]]*//' > deploy.env
+          ENVIRONMENT="${API_ENVIRONMENT}"
+          POSTGRES_PASSWORD="${POSTGRES_PASSWORD}"
+          DATABASE_URL="${DATABASE_URL}"
+          JWT_SIGNING_KEY="${JWT_SIGNING_KEY}"
+          CORS_ALLOWED_ORIGINS="${CORS_ALLOWED_ORIGINS}"
+          API_IMAGE="${API_IMAGE}:${IMAGE_SHA}"
+          MIGRATE_IMAGE="${MIGRATE_IMAGE}:${IMAGE_SHA}"
+          DEPLOYENV
 
-  deploy:
-    name: Deploy Cloud Run service
-    needs: [guard, build-and-push, migrate]
-    if: needs.guard.outputs.configured == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - id: auth
-        name: Authenticate to Google Cloud (Workload Identity Federation)
-        uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
-
-      - name: Set up Cloud SDK
-        uses: google-github-actions/setup-gcloud@v2
-        with:
-          project_id: ${{ secrets.GCP_PROJECT_ID }}
-
-      - name: Deploy rize-backend-integration
+      - name: Ensure remote deploy directory exists
         run: |
-          gcloud run deploy rize-backend-integration \
-            --image="${{ needs.build-and-push.outputs.api-image }}:${{ github.sha }}" \
-            --region="${{ secrets.GCP_REGION }}" \
+          gcloud compute ssh "${{ vars.GCE_INSTANCE }}" \
+            --zone="${{ vars.GCE_ZONE }}" \
             --project="${{ secrets.GCP_PROJECT_ID }}" \
-            --service-account="rize-backend-runtime@${{ secrets.GCP_PROJECT_ID }}.iam.gserviceaccount.com" \
-            --allow-unauthenticated \
-            --max-instances=2 \
-            --set-env-vars="^@@^ENVIRONMENT=${{ env.API_JOB_ENVIRONMENT }}@@CORS_ALLOWED_ORIGINS=${{ vars.INTEGRATION_CORS_ALLOWED_ORIGINS }}" \
-            --set-secrets="DATABASE_URL=${{ secrets.INTEGRATION_DATABASE_URL_SECRET }},JWT_SIGNING_KEY=${{ secrets.INTEGRATION_JWT_SIGNING_KEY_SECRET }}" \
-            --quiet
+            --tunnel-through-iap \
+            --command="mkdir -p ~/rize-backend"
+
+      - name: Copy compose file and .env to the VM
+        run: |
+          gcloud compute scp deploy/docker-compose.deploy.yml \
+            "${{ vars.GCE_INSTANCE }}":~/rize-backend/docker-compose.yml \
+            --zone="${{ vars.GCE_ZONE }}" \
+            --project="${{ secrets.GCP_PROJECT_ID }}" \
+            --tunnel-through-iap
+          gcloud compute scp deploy.env \
+            "${{ vars.GCE_INSTANCE }}":~/rize-backend/.env \
+            --zone="${{ vars.GCE_ZONE }}" \
+            --project="${{ secrets.GCP_PROJECT_ID }}" \
+            --tunnel-through-iap
+
+      - name: Pull images, run migrations, deploy api
+        run: |
+          ACCESS_TOKEN="$(gcloud auth print-access-token)"
+          gcloud compute ssh "${{ vars.GCE_INSTANCE }}" \
+            --zone="${{ vars.GCE_ZONE }}" \
+            --project="${{ secrets.GCP_PROJECT_ID }}" \
+            --tunnel-through-iap \
+            --command="docker login -u oauth2accesstoken --password-stdin https://${{ secrets.GCP_REGION }}-docker.pkg.dev && \
+              cd ~/rize-backend && \
+              docker compose --env-file .env pull && \
+              docker compose --env-file .env run --rm migrate && \
+              docker compose --env-file .env up -d api" \
+            <<< "${ACCESS_TOKEN}"
+
+      - name: Post-deploy health check
+        run: |
+          gcloud compute ssh "${{ vars.GCE_INSTANCE }}" \
+            --zone="${{ vars.GCE_ZONE }}" \
+            --project="${{ secrets.GCP_PROJECT_ID }}" \
+            --tunnel-through-iap \
+            --command="curl --fail --silent --show-error --max-time 10 http://localhost:8080/healthz"
