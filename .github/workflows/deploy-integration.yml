@@ -177,7 +177,23 @@ jobs:
             --zone="${{ vars.GCE_ZONE }}" \
             --project="${{ secrets.GCP_PROJECT_ID }}" \
             --tunnel-through-iap
+          # .env holds plaintext secrets (DATABASE_URL, JWT_SIGNING_KEY,
+          # POSTGRES_PASSWORD) — lock it down to the ssh'd-in user
+          # immediately; it's deleted again once `up -d` no longer needs it
+          # (see the deploy step below).
+          gcloud compute ssh "${{ vars.GCE_INSTANCE }}" \
+            --zone="${{ vars.GCE_ZONE }}" \
+            --project="${{ secrets.GCP_PROJECT_ID }}" \
+            --tunnel-through-iap \
+            --command="chmod 600 ~/rize-backend/.env"
 
+      # Host docker commands run under sudo: the OS Login ssh user is not a
+      # member of the docker group (nothing in deploy/bootstrap-gce.sh's
+      # startup script adds it), so the docker-ce root:docker 0660 socket
+      # rejects an unprivileged `docker`/`docker compose` invocation.
+      # `docker compose run --rm -T migrate` disables pseudo-TTY allocation,
+      # which isn't available (and isn't needed) for a one-shot,
+      # non-interactive migration run over a scripted ssh command.
       - name: Pull images, run migrations, deploy api
         run: |
           ACCESS_TOKEN="$(gcloud auth print-access-token)"
@@ -185,17 +201,30 @@ jobs:
             --zone="${{ vars.GCE_ZONE }}" \
             --project="${{ secrets.GCP_PROJECT_ID }}" \
             --tunnel-through-iap \
-            --command="docker login -u oauth2accesstoken --password-stdin https://${{ secrets.GCP_REGION }}-docker.pkg.dev && \
+            --command="sudo docker login -u oauth2accesstoken --password-stdin https://${{ secrets.GCP_REGION }}-docker.pkg.dev && \
               cd ~/rize-backend && \
-              docker compose --env-file .env pull && \
-              docker compose --env-file .env run --rm migrate && \
-              docker compose --env-file .env up -d api" \
+              sudo docker compose --env-file .env pull && \
+              sudo docker compose --env-file .env run --rm -T migrate && \
+              sudo docker compose --env-file .env up -d api && \
+              rm -f .env" \
             <<< "${ACCESS_TOKEN}"
 
+      # docker compose up -d returns as soon as the container is created,
+      # not once the app is actually accepting connections, so this polls
+      # /healthz with a bounded retry loop instead of curling once
+      # immediately after the deploy step above.
       - name: Post-deploy health check
         run: |
           gcloud compute ssh "${{ vars.GCE_INSTANCE }}" \
             --zone="${{ vars.GCE_ZONE }}" \
             --project="${{ secrets.GCP_PROJECT_ID }}" \
             --tunnel-through-iap \
-            --command="curl --fail --silent --show-error --max-time 10 http://localhost:8080/healthz"
+            --command="for i in \$(seq 1 12); do
+              if curl --fail --silent --show-error --max-time 5 http://localhost:8080/healthz; then
+                exit 0
+              fi
+              echo \"healthz not ready yet (attempt \$i/12), retrying in 5s...\"
+              sleep 5
+            done
+            echo \"healthz did not return 200 within 60s\" >&2
+            exit 1"
