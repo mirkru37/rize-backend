@@ -33,6 +33,15 @@ type fakeQuerier struct {
 	refreshTokens map[string]storedb.RefreshToken // key: id string
 	tokensByHash  map[string]string               // key: hex(hash) -> id string
 	seq           int64
+
+	// failOnce, keyed by method name, lets a test force the next call to
+	// that method to fail with the given error — a one-shot fault
+	// injection hook used to exercise Service methods' "unexpected
+	// database error" defensive branches (as opposed to the expected
+	// pgx.ErrNoRows path every other fakeQuerier method already models),
+	// which a real Postgres-backed integration test has no reliable way to
+	// trigger on demand either.
+	failOnce map[string]error
 }
 
 func newFakeQuerier() *fakeQuerier {
@@ -42,7 +51,28 @@ func newFakeQuerier() *fakeQuerier {
 		devices:       map[string]storedb.Device{},
 		refreshTokens: map[string]storedb.RefreshToken{},
 		tokensByHash:  map[string]string{},
+		failOnce:      map[string]error{},
 	}
+}
+
+// failNextCallTo arranges for the next call to the named fakeQuerier
+// method to return err instead of its normal result.
+func (f *fakeQuerier) failNextCallTo(method string, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failOnce[method] = err
+}
+
+// takeInjectedFailure returns (true, err) exactly once per failNextCallTo
+// call for method, and (false, nil) otherwise.
+func (f *fakeQuerier) takeInjectedFailure(method string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	err, ok := f.failOnce[method]
+	if ok {
+		delete(f.failOnce, method)
+	}
+	return ok, err
 }
 
 func (f *fakeQuerier) nextSeq() int64 {
@@ -61,6 +91,9 @@ func newUUID() pgtype.UUID {
 func hashKey(h []byte) string { return fmt.Sprintf("%x", h) }
 
 func (f *fakeQuerier) CreateDevice(_ context.Context, arg storedb.CreateDeviceParams) (storedb.Device, error) {
+	if ok, err := f.takeInjectedFailure("CreateDevice"); ok {
+		return storedb.Device{}, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -80,6 +113,9 @@ func (f *fakeQuerier) CreateDevice(_ context.Context, arg storedb.CreateDevicePa
 }
 
 func (f *fakeQuerier) CreateRefreshToken(_ context.Context, arg storedb.CreateRefreshTokenParams) (storedb.RefreshToken, error) {
+	if ok, err := f.takeInjectedFailure("CreateRefreshToken"); ok {
+		return storedb.RefreshToken{}, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -128,6 +164,9 @@ func (f *fakeQuerier) CreateUser(_ context.Context, arg storedb.CreateUserParams
 }
 
 func (f *fakeQuerier) GetDeviceByID(_ context.Context, arg storedb.GetDeviceByIDParams) (storedb.Device, error) {
+	if ok, err := f.takeInjectedFailure("GetDeviceByID"); ok {
+		return storedb.Device{}, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -362,6 +401,9 @@ func (f *fakeQuerier) GetUserByEmail(_ context.Context, email *string) (storedb.
 }
 
 func (f *fakeQuerier) GetUserByID(_ context.Context, id pgtype.UUID) (storedb.User, error) {
+	if ok, err := f.takeInjectedFailure("GetUserByID"); ok {
+		return storedb.User{}, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	u, ok := f.users[id.String()]
@@ -384,6 +426,9 @@ func (f *fakeQuerier) ListActiveRefreshTokensByUser(_ context.Context, userID pg
 }
 
 func (f *fakeQuerier) ListDevicesByUser(_ context.Context, userID pgtype.UUID) ([]storedb.Device, error) {
+	if ok, err := f.takeInjectedFailure("ListDevicesByUser"); ok {
+		return nil, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []storedb.Device
@@ -396,6 +441,9 @@ func (f *fakeQuerier) ListDevicesByUser(_ context.Context, userID pgtype.UUID) (
 }
 
 func (f *fakeQuerier) RevokeDevice(_ context.Context, arg storedb.RevokeDeviceParams) error {
+	if ok, err := f.takeInjectedFailure("RevokeDevice"); ok {
+		return err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	d, ok := f.devices[arg.ID.String()]
@@ -408,6 +456,9 @@ func (f *fakeQuerier) RevokeDevice(_ context.Context, arg storedb.RevokeDevicePa
 }
 
 func (f *fakeQuerier) RevokeRefreshTokenFamily(_ context.Context, familyID pgtype.UUID) error {
+	if ok, err := f.takeInjectedFailure("RevokeRefreshTokenFamily"); ok {
+		return err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for id, rt := range f.refreshTokens {
@@ -432,6 +483,9 @@ func (f *fakeQuerier) RevokeRefreshTokenFamilyForUser(_ context.Context, arg sto
 }
 
 func (f *fakeQuerier) RevokeRefreshTokensByDevice(_ context.Context, arg storedb.RevokeRefreshTokensByDeviceParams) error {
+	if ok, err := f.takeInjectedFailure("RevokeRefreshTokensByDevice"); ok {
+		return err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for id, rt := range f.refreshTokens {
@@ -444,6 +498,9 @@ func (f *fakeQuerier) RevokeRefreshTokensByDevice(_ context.Context, arg storedb
 }
 
 func (f *fakeQuerier) RotateRefreshToken(_ context.Context, arg storedb.RotateRefreshTokenParams) (storedb.RefreshToken, error) {
+	if ok, err := f.takeInjectedFailure("RotateRefreshToken"); ok {
+		return storedb.RefreshToken{}, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	rt, ok := f.refreshTokens[arg.ID.String()]
@@ -481,6 +538,9 @@ func (f *fakeQuerier) TouchDeviceLastSeen(_ context.Context, arg storedb.TouchDe
 }
 
 func (f *fakeQuerier) UpdateDeviceMetadata(_ context.Context, arg storedb.UpdateDeviceMetadataParams) (storedb.Device, error) {
+	if ok, err := f.takeInjectedFailure("UpdateDeviceMetadata"); ok {
+		return storedb.Device{}, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	d, ok := f.devices[arg.ID.String()]
@@ -497,6 +557,9 @@ func (f *fakeQuerier) UpdateDeviceMetadata(_ context.Context, arg storedb.Update
 }
 
 func (f *fakeQuerier) UpdateDeviceName(_ context.Context, arg storedb.UpdateDeviceNameParams) (storedb.Device, error) {
+	if ok, err := f.takeInjectedFailure("UpdateDeviceName"); ok {
+		return storedb.Device{}, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	d, ok := f.devices[arg.ID.String()]
@@ -509,6 +572,9 @@ func (f *fakeQuerier) UpdateDeviceName(_ context.Context, arg storedb.UpdateDevi
 }
 
 func (f *fakeQuerier) UpdateUserProfile(_ context.Context, arg storedb.UpdateUserProfileParams) (storedb.User, error) {
+	if ok, err := f.takeInjectedFailure("UpdateUserProfile"); ok {
+		return storedb.User{}, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	u, ok := f.users[arg.ID.String()]

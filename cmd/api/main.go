@@ -62,6 +62,16 @@ func run(logger *slog.Logger, cfg config.Config) error {
 		defer pool.Close()
 	}
 
+	return serve(ctx, logger, cfg, pool)
+}
+
+// serve builds the HTTP server, starts it, and blocks until ctx is
+// canceled or the server itself fails, then shuts down gracefully — the
+// part of run() that doesn't touch OS signals or the database pool,
+// extracted so it's unit-testable with an injectable, directly-cancelable
+// ctx (run() ties ctx to signal.NotifyContext, which a test can't trigger
+// deterministically) instead of requiring an actual SIGINT/SIGTERM.
+func serve(ctx context.Context, logger *slog.Logger, cfg config.Config, pool *pgxpool.Pool) error {
 	router := newRouter(logger, cfg, pool)
 
 	srv := &http.Server{

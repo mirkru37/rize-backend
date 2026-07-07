@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -327,6 +328,114 @@ func TestAppsHappyPath(t *testing.T) {
 	}
 	if total != 15*60 {
 		t.Errorf("total seconds = %d, want %d", total, 15*60)
+	}
+}
+
+// TestCategoriesCategoryIDFilterOnClosedDay exercises categoryTotals'
+// cagg-path category_id post-filter branch (both the matching and
+// non-matching/invalid cases).
+func TestCategoriesCategoryIDFilterOnClosedDay(t *testing.T) {
+	pool := testDBPool(t)
+	q := storedb.New(pool)
+	user, deviceA, _ := newUserAndDevices(t, q)
+	cat := newCategory(t, q, user.ID, "Filtered Category")
+
+	day := pastDay(11)
+	insertEvent(t, q, user.ID, deviceA.ID, day.Add(time.Hour), day.Add(time.Hour+10*time.Minute), eventOpts{CategoryID: cat.ID})
+	refreshCaggs(t, pool)
+
+	svc := &Service{Queries: q}
+	matched, err := svc.Categories(context.Background(), user.ID.String(), day, day.AddDate(0, 0, 1), reportFilters{CategoryID: cat.ID.String()})
+	if err != nil {
+		t.Fatalf("Categories (category_id filter, match): %v", err)
+	}
+	var total int64
+	for _, c := range matched.Categories {
+		total += c.Seconds
+	}
+	if total != 10*60 {
+		t.Errorf("total seconds = %d, want %d", total, 10*60)
+	}
+
+	unmatched, err := svc.Categories(context.Background(), user.ID.String(), day, day.AddDate(0, 0, 1), reportFilters{
+		CategoryID: "00000000-0000-0000-0000-000000000000",
+	})
+	if err != nil {
+		t.Fatalf("Categories (category_id filter, no match): %v", err)
+	}
+	if len(unmatched.Categories) != 0 {
+		t.Errorf("Categories (category_id filter, no match) = %+v, want empty", unmatched.Categories)
+	}
+
+	if _, err := svc.Categories(context.Background(), user.ID.String(), day, day.AddDate(0, 0, 1), reportFilters{
+		CategoryID: "not-a-valid-uuid",
+	}); !errors.Is(err, ErrValidation) {
+		t.Errorf("Categories (invalid category_id) error = %v, want ErrValidation", err)
+	}
+}
+
+// TestAppsDeviceFilterFallsBackToRaw exercises appTotals' raw-fallback
+// branch (a device_id filter is incompatible with the daily_app_totals
+// aggregate, per appTotals' doc comment), which TestAppsHappyPath's
+// filter-less request never reaches.
+func TestAppsDeviceFilterFallsBackToRaw(t *testing.T) {
+	q := testQueries(t)
+	user, deviceA, deviceB := newUserAndDevices(t, q)
+
+	day := pastDay(8)
+	insertEvent(t, q, user.ID, deviceA.ID, day.Add(time.Hour), day.Add(time.Hour+10*time.Minute), eventOpts{})
+	insertEvent(t, q, user.ID, deviceB.ID, day.Add(2*time.Hour), day.Add(2*time.Hour+20*time.Minute), eventOpts{})
+
+	svc := &Service{Queries: q}
+	result, err := svc.Apps(context.Background(), user.ID.String(), day, day.AddDate(0, 0, 1), reportFilters{DeviceID: deviceA.ID.String()})
+	if err != nil {
+		t.Fatalf("Apps: %v", err)
+	}
+	var total int64
+	for _, a := range result.Apps {
+		total += a.Seconds
+	}
+	if total != 10*60 {
+		t.Errorf("total seconds = %d, want %d (only deviceA's event)", total, 10*60)
+	}
+}
+
+// TestAppsAppIDFilterOnClosedDay exercises appTotals' cagg-path app_id
+// post-filter branch.
+func TestAppsAppIDFilterOnClosedDay(t *testing.T) {
+	pool := testDBPool(t)
+	q := storedb.New(pool)
+	user, deviceA, _ := newUserAndDevices(t, q)
+
+	day := pastDay(9)
+	insertEvent(t, q, user.ID, deviceA.ID, day.Add(time.Hour), day.Add(time.Hour+15*time.Minute), eventOpts{})
+	refreshCaggs(t, pool)
+
+	svc := &Service{Queries: q}
+	unfiltered, err := svc.Apps(context.Background(), user.ID.String(), day, day.AddDate(0, 0, 1), reportFilters{})
+	if err != nil {
+		t.Fatalf("Apps (unfiltered): %v", err)
+	}
+	if len(unfiltered.Apps) == 0 {
+		t.Fatal("expected at least one app bucket to filter by")
+	}
+
+	// Filtering by an app_id that doesn't match anything must return an
+	// empty (not error) result, per appTotals' filtered-but-absent branch.
+	filtered, err := svc.Apps(context.Background(), user.ID.String(), day, day.AddDate(0, 0, 1), reportFilters{
+		AppID: "00000000-0000-0000-0000-000000000000",
+	})
+	if err != nil {
+		t.Fatalf("Apps (app_id filter, no match): %v", err)
+	}
+	if len(filtered.Apps) != 0 {
+		t.Errorf("Apps (app_id filter, no match) = %+v, want empty", filtered.Apps)
+	}
+
+	if _, err := svc.Apps(context.Background(), user.ID.String(), day, day.AddDate(0, 0, 1), reportFilters{
+		AppID: "not-a-valid-uuid",
+	}); !errors.Is(err, ErrValidation) {
+		t.Errorf("Apps (invalid app_id) error = %v, want ErrValidation", err)
 	}
 }
 
