@@ -9,6 +9,20 @@ on:
 permissions:
   contents: read
 
+env:
+  # RIZ-69: single knob for the total-statement coverage gate enforced by
+  # the Test job below. The ticket's original target was 90%; actual
+  # first-party coverage after this ticket's test additions is ~85% (up
+  # from a ~50% baseline — see the PR description for the per-package
+  # breakdown). The threshold was set to 80% with explicit sign-off
+  # (leaving comfortable headroom above the current number) rather than
+  # continuing to chase the last few points across the hardest-to-test
+  # packages (auth's tx-based refresh path, sync's cagg/pull edge cases,
+  # cmd/api's process bootstrap). Raise this over time as coverage
+  # improves; never lower it (or widen the exclusion list below) just to
+  # make a red run pass — add tests instead.
+  COVERAGE_THRESHOLD: 80
+
 jobs:
   lint:
     name: Lint
@@ -25,12 +39,116 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    # RIZ-69: a real TimescaleDB service container, migrated before the
+    # test step runs, so DB-backed integration tests (internal/store,
+    # internal/auth, internal/activities, internal/categories, ...; every
+    # one of them skips itself when DATABASE_URL is unset, per each
+    # package's testPool/testQueries helper) actually run in CI instead of
+    # being silently skipped, and so the coverage measured below reflects
+    # real coverage rather than only the DB-independent subset. Same image
+    # or config as docker-compose.yml's db + migrate services.
+    services:
+      db:
+        image: timescale/timescaledb:latest-pg16
+        env:
+          POSTGRES_USER: rize
+          POSTGRES_PASSWORD: rize
+          POSTGRES_DB: rize
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rize -d rize"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://rize:rize@localhost:5432/rize?sslmode=disable
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: go test -race ./...
+
+      - name: Run migrations
+        run: |
+          docker run --rm --network host \
+            -v "${{ github.workspace }}/internal/store/migrations:/migrations" \
+            migrate/migrate:v4.17.1 \
+            -path=/migrations -database "$DATABASE_URL" up
+
+      - name: Test with coverage
+        run: go test -race -coverprofile=coverage.out -covermode=atomic ./... | tee test-output.txt
+
+      # RIZ-69: exclude generated code from the coverage measurement so the
+      # gate below only ever judges hand-written statements. This is the
+      # complete exclusion list:
+      #   - internal/store/storedb/**: sqlc-generated query bindings (every
+      #     file in the package carries a "Code generated ... DO NOT EDIT"
+      #     header). There is no hand-written logic in this package.
+      # Nothing else is excluded: no mocks/fakes/test doubles exist in this
+      # codebase as separate hand-maintained files (fake_querier_test.go
+      # etc. are _test.go files, already outside go test's coverage
+      # instrumentation of non-test code), and every other package —
+      # including internal/store's hand-written pool.go — counts toward
+      # the gate.
+      - name: Filter generated code from the coverage profile
+        run: |
+          grep -v '/internal/store/storedb/' coverage.out > coverage.out.filtered
+          mv coverage.out.filtered coverage.out
+
+      - name: Generate per-function report and HTML report
+        if: always()
+        run: |
+          go tool cover -func=coverage.out | tee coverage-func.txt
+          go tool cover -html=coverage.out -o coverage.html
+
+      - name: Enforce coverage gate
+        run: |
+          total=$(grep '^total:' coverage-func.txt | awk '{print $3}' | tr -d '%')
+          echo "Total statement coverage (first-party only): ${total}% (threshold: ${COVERAGE_THRESHOLD}%)"
+          awk -v t="$total" -v thresh="$COVERAGE_THRESHOLD" 'BEGIN { exit (t+0 >= thresh+0) ? 0 : 1 }' \
+            || { echo "::error::total coverage ${total}% is below the ${COVERAGE_THRESHOLD}% threshold"; exit 1; }
+
+      - name: Write coverage summary
+        if: always()
+        run: |
+          total=$(grep '^total:' coverage-func.txt | awk '{print $3}' | tr -d '%')
+          {
+            echo "### Coverage report (RIZ-69)"
+            echo
+            echo "Threshold: **${COVERAGE_THRESHOLD}%** — Total (first-party only, generated \`internal/store/storedb\` excluded): **${total}%**"
+            echo
+            echo "| Package | Coverage |"
+            echo "|---|---|"
+            grep 'coverage:' test-output.txt \
+              | sed -E 's#^(ok|FAIL)[[:space:]]+([^[:space:]]+).*coverage:[[:space:]]*([0-9.]+)% of statements.*#| \2 | \3% |#' \
+              || true
+            echo
+            echo "Total: ${total}%"
+          } > coverage-summary.md
+          cat coverage-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-reports-${{ github.sha }}
+          path: |
+            coverage.out
+            coverage.html
+            coverage-func.txt
+          if-no-files-found: warn
+
+      - name: Post coverage summary on PR
+        if: ${{ always() && github.event_name == 'pull_request' }}
+        continue-on-error: true
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: coverage-report
+          path: coverage-summary.md
 
   vuln:
     name: Vulnerability scan
