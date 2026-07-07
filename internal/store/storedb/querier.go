@@ -291,6 +291,28 @@ type Querier interface {
 	// the window before merging. Joins apps/categories/projects so the report
 	// layer never needs a second round trip to resolve display names.
 	RawActivityEventsForReport(ctx context.Context, arg RawActivityEventsForReportParams) ([]RawActivityEventsForReportRow, error)
+	// Atomically records a failed password check against an existing account
+	// and, if the post-increment attempt count reaches @threshold, escalates
+	// into (or re-escalates) a lockout — per RIZ-59 / documentation/security.md
+	// §API hardening ("brute-force lockout on login").
+	//
+	// Everything is computed from the row's own current values inside this
+	// single UPDATE statement (failed_login_attempts, lockout_count), rather
+	// than read in Go and written back separately, so concurrent logins
+	// against the same account can never race a read-modify-write: Postgres's
+	// row-level write lock on this UPDATE serializes concurrent callers, and
+	// each one sees the effect of the previous one's commit.
+	//
+	// The lockout duration is base_duration_seconds doubled once per prior
+	// lockout (lockout_count, read BEFORE this attempt's own increment),
+	// capped at max_duration_seconds. @now is supplied by the caller (the
+	// service's injectable clock) rather than Postgres's own now(), so the
+	// lockout window is deterministic and testable under a fake clock.
+	RecordFailedLoginAttempt(ctx context.Context, arg RecordFailedLoginAttemptParams) (User, error)
+	// Clears failed-attempt/lockout-escalation state on a successful login,
+	// per RIZ-59's reset semantics ("counter and lockout-escalation reset on
+	// successful login after expiry").
+	ResetLoginLockout(ctx context.Context, arg ResetLoginLockoutParams) error
 	// Scoped by user_id per documentation/security.md §Tenant Isolation.
 	RevokeDevice(ctx context.Context, arg RevokeDeviceParams) error
 	RevokeRefreshTokenFamily(ctx context.Context, familyID pgtype.UUID) error

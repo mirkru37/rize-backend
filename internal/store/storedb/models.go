@@ -171,17 +171,20 @@ type Tag struct {
 }
 
 type User struct {
-	ID           pgtype.UUID        `json:"id"`
-	Email        *string            `json:"email"`
-	PasswordHash *string            `json:"password_hash"`
-	AppleUserID  *string            `json:"apple_user_id"`
-	DisplayName  *string            `json:"display_name"`
-	Role         string             `json:"role"`
-	Timezone     *string            `json:"timezone"`
-	CreatedAt    pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
-	DeletedAt    pgtype.Timestamptz `json:"deleted_at"`
-	ServerSeq    int64              `json:"server_seq"`
+	ID                  pgtype.UUID        `json:"id"`
+	Email               *string            `json:"email"`
+	PasswordHash        *string            `json:"password_hash"`
+	AppleUserID         *string            `json:"apple_user_id"`
+	DisplayName         *string            `json:"display_name"`
+	Role                string             `json:"role"`
+	Timezone            *string            `json:"timezone"`
+	CreatedAt           pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt           pgtype.Timestamptz `json:"updated_at"`
+	DeletedAt           pgtype.Timestamptz `json:"deleted_at"`
+	ServerSeq           int64              `json:"server_seq"`
+	FailedLoginAttempts int32              `json:"failed_login_attempts"`
+	LockoutCount        int32              `json:"lockout_count"`
+	LockedUntil         pgtype.Timestamptz `json:"locked_until"`
 }
 
 type UserAppSetting struct {
