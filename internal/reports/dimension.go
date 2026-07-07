@@ -61,6 +61,31 @@ func pgTimestamptz(t time.Time) pgtype.Timestamptz {
 	return pgtype.Timestamptz{Time: t, Valid: true}
 }
 
+// windowSeconds is the closed-period cagg queries' device-overlap cap
+// bound: the length, in seconds, of a closed window, used by
+// internal/store/queries/activities.sql's CategoryTotalsForRange and
+// AppTotalsForRange as an UPPER BOUND on how much same-device overlap a
+// device's total_s can be inflated by. It is not the same computation as
+// perDeviceSeconds' interval merge for the raw path: that clips and
+// merges individual event intervals, so it always returns each device's
+// exact non-overlapping covered duration; this instead caps an
+// already-summed total_s at the window's length, which only catches
+// overlap severe enough to push the naive sum above the window itself —
+// see CategoryTotalsForRange's doc comment for a worked example where the
+// two disagree. The two callers only ever invoke this with a genuinely
+// closed (non-empty, from-before-to) window per splitClosedOpen, but the
+// callers pass the result straight into LEAST(device_total_s,
+// window_seconds) in SQL, where a zero or negative value would silently
+// zero out every total — so this defends that invariant explicitly rather
+// than relying on the caller never regressing it.
+func windowSeconds(w window) int64 {
+	seconds := int64(w.To.Sub(w.From).Seconds())
+	if seconds < 1 {
+		seconds = 1
+	}
+	return seconds
+}
+
 func derefStr(p *string) string {
 	if p == nil {
 		return ""
@@ -184,9 +209,10 @@ func (s *Service) categoryTotals(ctx context.Context, uid pgtype.UUID, from, to 
 	closed, hasClosed, rawWindows := splitClosedOpen(from, to, time.Now())
 	if hasClosed {
 		rows, err := s.Queries.CategoryTotalsForRange(ctx, storedb.CategoryTotalsForRangeParams{
-			UserID:  uid,
-			FromDay: pgTimestamptz(closed.From),
-			ToDay:   pgTimestamptz(closed.To),
+			UserID:        uid,
+			FromDay:       pgTimestamptz(closed.From),
+			ToDay:         pgTimestamptz(closed.To),
+			WindowSeconds: windowSeconds(closed),
 		})
 		if err != nil {
 			return nil, fmt.Errorf("reports: category totals: %w", err)
@@ -236,9 +262,10 @@ func (s *Service) appTotals(ctx context.Context, uid pgtype.UUID, from, to time.
 	closed, hasClosed, rawWindows := splitClosedOpen(from, to, time.Now())
 	if hasClosed {
 		rows, err := s.Queries.AppTotalsForRange(ctx, storedb.AppTotalsForRangeParams{
-			UserID:  uid,
-			FromDay: pgTimestamptz(closed.From),
-			ToDay:   pgTimestamptz(closed.To),
+			UserID:        uid,
+			FromDay:       pgTimestamptz(closed.From),
+			ToDay:         pgTimestamptz(closed.To),
+			WindowSeconds: windowSeconds(closed),
 		})
 		if err != nil {
 			return nil, fmt.Errorf("reports: app totals: %w", err)

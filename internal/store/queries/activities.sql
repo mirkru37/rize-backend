@@ -35,9 +35,15 @@ LIMIT sqlc.arg(page_limit);
 -- The report layer's raw-event pass, per documentation/architecture-backend.md
 -- §Aggregation Strategy: used (a) always for the current/partial period,
 -- and (b) as the only path for filters (device_id, precision) or
--- dimensions (project) the continuous aggregates cannot serve, since
--- daily_app_totals/daily_category_totals carry no device_id or precision
--- column and no project-dimensioned aggregate exists at all — see
+-- dimensions (project) the continuous aggregates cannot serve. As of
+-- migrations 000034-000036, daily_app_totals/daily_category_totals do
+-- carry a device_id column, but CategoryTotalsForRange/AppTotalsForRange
+-- below only use it for a same-device overlap *cap* (a window-length
+-- upper bound, not an exact merge — see those queries' comments); neither
+-- query can honor an explicit device_id filter or a precision filter (no
+-- precision column exists on any cagg), and no project-dimensioned
+-- aggregate exists at all, so a device_id/precision-filtered or
+-- project-dimensioned request still falls back to this raw pass — see
 -- internal/reports' service.go doc comment for the full resolution.
 --
 -- Selects events overlapping [from_ts, to_ts) — not merely started within
@@ -75,16 +81,44 @@ ORDER BY e.device_id, e.started_at;
 -- reports/summary's category breakdown: sums the daily_category_totals
 -- continuous aggregate over [from_day, to_day) per
 -- documentation/architecture-backend.md §Aggregation Strategy. Only used
--- when the request has no device_id/precision filter (the aggregate has
--- neither dimension) — see internal/reports/service.go.
+-- when the request has no device_id/precision filter — see
+-- internal/reports/service.go.
+--
+-- Bounds (does NOT reproduce) the raw-event path's same-device overlap
+-- handling (documentation/sync-protocol.md §Overlap Rules;
+-- internal/reports/trim.go implements the actual interval merge for raw
+-- events): daily_category_totals is grouped by device_id (migration
+-- 000035), so each device's total_s is first summed across the requested
+-- days, then capped at window_seconds — the length of [from_day, to_day)
+-- in seconds — before being added into the category total. This is an
+-- UPPER BOUND on same-device overlap inflation, not the raw path's exact
+-- merged duration: the cap only removes overlap that pushes a device's
+-- naive summed total_s above the window's own length, so it agrees with
+-- the raw path exactly when a device's merged coverage spans the whole
+-- window, but can still overstate the total otherwise. For example, over
+-- a 24h window with same-device events covering 00:00-06:00 and
+-- 03:00-09:00 (merged coverage 9h, naive sum 12h), the raw path returns
+-- 9h while this query returns min(12h, 24h) = 12h. Cross-device overlap
+-- is still not trimmed either way: each device's capped total is summed
+-- into the category total independently, same as the raw path.
+-- window_seconds must be > 0 (validated by the caller — see
+-- internal/reports/dimension.go's windowSeconds) so LEAST(x, 0) can't
+-- silently zero every total.
 SELECT
-    d.category_id,
+    pd.category_id,
     c.name AS category_name,
-    sum(d.total_s)::bigint AS total_s
-FROM daily_category_totals d
-LEFT JOIN categories c ON c.id = d.category_id
-WHERE d.user_id = $1 AND d.day >= sqlc.arg(from_day)::timestamptz AND d.day < sqlc.arg(to_day)::timestamptz
-GROUP BY d.category_id, c.name;
+    sum(LEAST(pd.device_total_s, sqlc.arg(window_seconds)::bigint))::bigint AS total_s
+FROM (
+    SELECT
+        d.category_id,
+        d.device_id,
+        sum(d.total_s) AS device_total_s
+    FROM daily_category_totals d
+    WHERE d.user_id = $1 AND d.day >= sqlc.arg(from_day)::timestamptz AND d.day < sqlc.arg(to_day)::timestamptz
+    GROUP BY d.category_id, d.device_id
+) pd
+LEFT JOIN categories c ON c.id = pd.category_id
+GROUP BY pd.category_id, c.name;
 
 -- name: AppTotalsForRange :many
 -- Closed-period fast path for reports/apps: sums the daily_app_totals
@@ -92,12 +126,27 @@ GROUP BY d.category_id, c.name;
 -- documentation/architecture-backend.md §Aggregation Strategy. Only used
 -- when the request has no device_id/precision filter — see
 -- internal/reports/service.go.
+--
+-- Same per-device window-capping as CategoryTotalsForRange above, using
+-- daily_app_totals' device_id column (migration 000034) — an upper bound
+-- on same-device overlap inflation for closed periods, not a
+-- reproduction of the raw path's exact interval merge. See
+-- CategoryTotalsForRange's comment for the worked counterexample where
+-- the two paths diverge. window_seconds must be > 0 for the same reason
+-- noted there.
 SELECT
-    d.app_id,
+    pd.app_id,
     a.name AS app_name,
     a.bundle_id AS app_bundle_id,
-    sum(d.total_s)::bigint AS total_s
-FROM daily_app_totals d
-LEFT JOIN apps a ON a.id = d.app_id
-WHERE d.user_id = $1 AND d.day >= sqlc.arg(from_day)::timestamptz AND d.day < sqlc.arg(to_day)::timestamptz
-GROUP BY d.app_id, a.name, a.bundle_id;
+    sum(LEAST(pd.device_total_s, sqlc.arg(window_seconds)::bigint))::bigint AS total_s
+FROM (
+    SELECT
+        d.app_id,
+        d.device_id,
+        sum(d.total_s) AS device_total_s
+    FROM daily_app_totals d
+    WHERE d.user_id = $1 AND d.day >= sqlc.arg(from_day)::timestamptz AND d.day < sqlc.arg(to_day)::timestamptz
+    GROUP BY d.app_id, d.device_id
+) pd
+LEFT JOIN apps a ON a.id = pd.app_id
+GROUP BY pd.app_id, a.name, a.bundle_id;

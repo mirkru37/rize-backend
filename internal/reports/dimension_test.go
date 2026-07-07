@@ -29,6 +29,37 @@ func TestMinTime(t *testing.T) {
 	}
 }
 
+// TestWindowSecondsClampsToAtLeastOne guards the LEAST(device_total_s,
+// window_seconds) invariant in CategoryTotalsForRange/AppTotalsForRange
+// (internal/store/queries/activities.sql): a zero or negative
+// window_seconds would zero out every capped total, silently. windowSeconds
+// is only ever called with a genuinely closed (from-before-to) window in
+// production, but this asserts the defensive clamp holds even for a
+// degenerate window rather than relying on that invariant never regressing.
+func TestWindowSecondsClampsToAtLeastOne(t *testing.T) {
+	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name string
+		w    window
+		want int64
+	}{
+		{name: "one day", w: window{From: base, To: base.AddDate(0, 0, 1)}, want: 86400},
+		{name: "one hour", w: window{From: base, To: base.Add(time.Hour)}, want: 3600},
+		{name: "empty window clamps to 1", w: window{From: base, To: base}, want: 1},
+		{name: "inverted window clamps to 1", w: window{From: base.AddDate(0, 0, 1), To: base}, want: 1},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			if got := windowSeconds(tt.w); got != tt.want {
+				t.Errorf("windowSeconds() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestDecodeCursorInternal(t *testing.T) {
 	c := cursor{StartedAt: time.Date(2024, 1, 1, 9, 0, 0, 0, time.UTC), EventID: "123e4567-e89b-12d3-a456-426614174000"}
 	encoded := encodeCursor(c)
