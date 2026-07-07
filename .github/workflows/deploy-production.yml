@@ -48,8 +48,6 @@ jobs:
     timeout-minutes: 20
     outputs:
       sha: ${{ steps.resolve.outputs.sha }}
-      api-image: ${{ steps.resolve.outputs.api-image }}
-      migrate-image: ${{ steps.resolve.outputs.migrate-image }}
       api-digest: ${{ steps.digests.outputs.api-digest }}
       migrate-digest: ${{ steps.digests.outputs.migrate-digest }}
     steps:
@@ -154,13 +152,20 @@ jobs:
           DATABASE_URL_SECRET: ${{ secrets.DATABASE_URL }}
           JWT_SIGNING_KEY: ${{ secrets.JWT_SIGNING_KEY }}
           CORS_ALLOWED_ORIGINS: ${{ vars.CORS_ALLOWED_ORIGINS }}
-          API_IMAGE: ${{ needs.resolve-image.outputs.api-image }}
-          MIGRATE_IMAGE: ${{ needs.resolve-image.outputs.migrate-image }}
+          GCP_REGION: ${{ secrets.GCP_REGION }}
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
           API_DIGEST: ${{ needs.resolve-image.outputs.api-digest }}
           MIGRATE_DIGEST: ${{ needs.resolve-image.outputs.migrate-digest }}
         run: |
           set +x
           DATABASE_URL="${DATABASE_URL_SECRET:-postgres://rize:${POSTGRES_PASSWORD}@timescaledb:5432/rize?sslmode=disable}"
+          # Image base paths are recomputed here from secrets rather than
+          # threaded through needs.resolve-image.outputs.*: GitHub Actions
+          # redacts any job output containing a secret value before a
+          # downstream job can read it, which previously left API_IMAGE /
+          # MIGRATE_IMAGE empty and produced an invalid docker reference.
+          API_IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${AR_REPO}/api"
+          MIGRATE_IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${AR_REPO}/migrate"
           # Every value is double-quoted so a multi-line JWT_SIGNING_KEY (a
           # PEM-encoded key, per internal/config's doc comment) round-trips
           # through the .env file intact — docker compose's dotenv parser

@@ -48,9 +48,6 @@ jobs:
     if: needs.guard.outputs.configured == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    outputs:
-      api-image: ${{ steps.vars.outputs.api-image }}
-      migrate-image: ${{ steps.vars.outputs.migrate-image }}
     steps:
       - uses: actions/checkout@v4
 
@@ -132,12 +129,19 @@ jobs:
           DATABASE_URL_SECRET: ${{ secrets.DATABASE_URL }}
           JWT_SIGNING_KEY: ${{ secrets.JWT_SIGNING_KEY }}
           CORS_ALLOWED_ORIGINS: ${{ vars.CORS_ALLOWED_ORIGINS }}
-          API_IMAGE: ${{ needs.build-and-push.outputs.api-image }}
-          MIGRATE_IMAGE: ${{ needs.build-and-push.outputs.migrate-image }}
+          GCP_REGION: ${{ secrets.GCP_REGION }}
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
         run: |
           set +x
           DATABASE_URL="${DATABASE_URL_SECRET:-postgres://rize:${POSTGRES_PASSWORD}@timescaledb:5432/rize?sslmode=disable}"
           IMAGE_SHA="${{ github.sha }}"
+          # Image base paths are recomputed here from secrets rather than
+          # threaded through needs.build-and-push.outputs.*: GitHub Actions
+          # redacts any job output containing a secret value before a
+          # downstream job can read it, which previously left API_IMAGE /
+          # MIGRATE_IMAGE empty and produced an invalid docker reference.
+          API_IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${AR_REPO}/api"
+          MIGRATE_IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${AR_REPO}/migrate"
           # The heredoc body below is indented to match this workflow file's
           # YAML nesting; the trailing `sed` strips that leading whitespace
           # so deploy.env ends up with flush-left KEY=VALUE lines. Nothing
