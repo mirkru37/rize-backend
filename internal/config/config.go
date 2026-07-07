@@ -65,6 +65,32 @@ const (
 	// DefaultAuthLockoutMaxDuration is used when AUTH_LOCKOUT_MAX_DURATION
 	// is not set: the ceiling the doubling lockout duration is capped at.
 	DefaultAuthLockoutMaxDuration = 24 * time.Hour
+
+	// DefaultSyncChangelogMaxAgeHours is used when SYNC_CHANGELOG_MAX_AGE
+	// is not set: 90 days (2160 hours). RIZ-72's age-based sync_changelog retention
+	// policy: rows older than this are eligible for pruning. 90 days
+	// comfortably bounds migration 000024/000025's "live row xmin must
+	// stay within 2^31 transactions of the current xid" invariant (that
+	// window would require a sustained throughput of roughly 276
+	// transactions/second for 90 days straight to exhaust, far beyond this
+	// system's expected write volume) while still giving a long-dormant
+	// device's stale local cursor a generous grace period before its next
+	// pull is forced into a full re-pull (see internal/sync/pull.go's
+	// cursor-reset check).
+	DefaultSyncChangelogMaxAgeHours = 90 * 24
+	// DefaultSyncChangelogPruneIntervalSeconds is used when
+	// SYNC_CHANGELOG_PRUNE_INTERVAL_SECONDS is not set: how often the
+	// in-process retention pruner (internal/sync's Pruner, started by
+	// cmd/api/main.go) wakes up to delete another batch of aged-out
+	// sync_changelog rows.
+	DefaultSyncChangelogPruneIntervalSeconds = 3600
+	// DefaultSyncChangelogPruneBatchSize is used when
+	// SYNC_CHANGELOG_PRUNE_BATCH_SIZE is not set: the maximum number of
+	// sync_changelog rows one prune tick deletes, bounding how long a
+	// single prune transaction holds row locks / how large one query's
+	// result set gets, per internal/store/queries/sync_retention.sql's
+	// SelectChangelogPruneBatch.
+	DefaultSyncChangelogPruneBatchSize = 5000
 )
 
 // EnvVarNames lists every environment variable Load reads. It exists so
@@ -82,6 +108,9 @@ var EnvVarNames = []string{
 	"AUTH_LOCKOUT_THRESHOLD",
 	"AUTH_LOCKOUT_BASE_DURATION",
 	"AUTH_LOCKOUT_MAX_DURATION",
+	"SYNC_CHANGELOG_MAX_AGE",
+	"SYNC_CHANGELOG_PRUNE_INTERVAL_SECONDS",
+	"SYNC_CHANGELOG_PRUNE_BATCH_SIZE",
 }
 
 // Config holds rize-backend's runtime configuration, loaded from
@@ -154,6 +183,19 @@ type Config struct {
 	AuthLockoutBaseDuration time.Duration
 	// AuthLockoutMaxDuration caps the doubling lockout duration.
 	AuthLockoutMaxDuration time.Duration
+
+	// SyncChangelogMaxAge is how old a sync_changelog row (by its
+	// created_at) must be before RIZ-72's retention pruner (internal/sync's
+	// Pruner) considers it eligible for deletion. See
+	// DefaultSyncChangelogMaxAgeHours for the 90-day default's rationale.
+	SyncChangelogMaxAge time.Duration
+	// SyncChangelogPruneInterval is how often the in-process retention
+	// pruner wakes up to delete another batch of aged-out sync_changelog
+	// rows.
+	SyncChangelogPruneInterval time.Duration
+	// SyncChangelogPruneBatchSize bounds how many sync_changelog rows one
+	// prune tick deletes.
+	SyncChangelogPruneBatchSize int
 }
 
 // Load builds a Config from environment variables, applying defaults for
@@ -161,20 +203,23 @@ type Config struct {
 // invalid value (e.g. a non-numeric rate limit).
 func Load() (Config, error) {
 	cfg := Config{
-		HTTPPort:                   getEnvDefault("PORT", DefaultHTTPPort),
-		Environment:                getEnvDefault("ENVIRONMENT", DefaultEnvironment),
-		DatabaseURL:                os.Getenv("DATABASE_URL"),
-		JWTSigningKey:              os.Getenv("JWT_SIGNING_KEY"),
-		CORSAllowedOrigins:         parseCSV(getEnvDefault("CORS_ALLOWED_ORIGINS", DefaultCORSAllowedOrigins)),
-		RateLimitRequestsPerMinute: DefaultRateLimitRequestsPerMinute,
-		ShutdownTimeout:            DefaultShutdownTimeout,
-		ReadyzDBPingTimeout:        DefaultReadyzDBPingTimeout,
-		ReadTimeout:                DefaultReadTimeout,
-		WriteTimeout:               DefaultWriteTimeout,
-		IdleTimeout:                DefaultIdleTimeout,
-		AuthLockoutThreshold:       DefaultAuthLockoutThreshold,
-		AuthLockoutBaseDuration:    DefaultAuthLockoutBaseDuration,
-		AuthLockoutMaxDuration:     DefaultAuthLockoutMaxDuration,
+		HTTPPort:                    getEnvDefault("PORT", DefaultHTTPPort),
+		Environment:                 getEnvDefault("ENVIRONMENT", DefaultEnvironment),
+		DatabaseURL:                 os.Getenv("DATABASE_URL"),
+		JWTSigningKey:               os.Getenv("JWT_SIGNING_KEY"),
+		CORSAllowedOrigins:          parseCSV(getEnvDefault("CORS_ALLOWED_ORIGINS", DefaultCORSAllowedOrigins)),
+		RateLimitRequestsPerMinute:  DefaultRateLimitRequestsPerMinute,
+		ShutdownTimeout:             DefaultShutdownTimeout,
+		ReadyzDBPingTimeout:         DefaultReadyzDBPingTimeout,
+		ReadTimeout:                 DefaultReadTimeout,
+		WriteTimeout:                DefaultWriteTimeout,
+		IdleTimeout:                 DefaultIdleTimeout,
+		AuthLockoutThreshold:        DefaultAuthLockoutThreshold,
+		AuthLockoutBaseDuration:     DefaultAuthLockoutBaseDuration,
+		AuthLockoutMaxDuration:      DefaultAuthLockoutMaxDuration,
+		SyncChangelogMaxAge:         time.Duration(DefaultSyncChangelogMaxAgeHours) * time.Hour,
+		SyncChangelogPruneInterval:  time.Duration(DefaultSyncChangelogPruneIntervalSeconds) * time.Second,
+		SyncChangelogPruneBatchSize: DefaultSyncChangelogPruneBatchSize,
 	}
 
 	if v := os.Getenv("RATE_LIMIT_REQUESTS_PER_MINUTE"); v != "" {
@@ -237,6 +282,39 @@ func Load() (Config, error) {
 			"invalid AUTH_LOCKOUT_MAX_DURATION %q: must be >= AUTH_LOCKOUT_BASE_DURATION %q",
 			cfg.AuthLockoutMaxDuration, cfg.AuthLockoutBaseDuration,
 		)
+	}
+
+	if v := os.Getenv("SYNC_CHANGELOG_MAX_AGE"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("invalid SYNC_CHANGELOG_MAX_AGE %q: %w", v, err)
+		}
+		if n <= 0 {
+			return Config{}, fmt.Errorf("invalid SYNC_CHANGELOG_MAX_AGE %q: must be positive", v)
+		}
+		cfg.SyncChangelogMaxAge = time.Duration(n) * time.Hour
+	}
+
+	if v := os.Getenv("SYNC_CHANGELOG_PRUNE_INTERVAL_SECONDS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("invalid SYNC_CHANGELOG_PRUNE_INTERVAL_SECONDS %q: %w", v, err)
+		}
+		if n <= 0 {
+			return Config{}, fmt.Errorf("invalid SYNC_CHANGELOG_PRUNE_INTERVAL_SECONDS %q: must be positive", v)
+		}
+		cfg.SyncChangelogPruneInterval = time.Duration(n) * time.Second
+	}
+
+	if v := os.Getenv("SYNC_CHANGELOG_PRUNE_BATCH_SIZE"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("invalid SYNC_CHANGELOG_PRUNE_BATCH_SIZE %q: %w", v, err)
+		}
+		if n <= 0 {
+			return Config{}, fmt.Errorf("invalid SYNC_CHANGELOG_PRUNE_BATCH_SIZE %q: must be positive", v)
+		}
+		cfg.SyncChangelogPruneBatchSize = n
 	}
 
 	if cfg.HTTPPort == "" {
