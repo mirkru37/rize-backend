@@ -72,6 +72,31 @@ func TestSplitClosedOpenUnalignedFromLeavesLeadingRawSegment(t *testing.T) {
 	}
 }
 
+// TestSplitClosedOpenSameDayUnalignedFullyPastRangeNoInvertedWindow is a
+// regression test (RIZ-74, PR #9 review follow-up): a range that starts and
+// ends within the same not-yet-day-aligned past day, entirely before
+// today, used to make the trailing-raw-window branch emit an inverted
+// (From > To) window on top of the leading segment that already covered
+// the whole range.
+func TestSplitClosedOpenSameDayUnalignedFullyPastRangeNoInvertedWindow(t *testing.T) {
+	now := mustParse(t, "2026-07-10T15:00:00Z")
+	from := mustParse(t, "2026-07-01T10:00:00Z")
+	to := mustParse(t, "2026-07-01T14:00:00Z")
+
+	closed, hasClosed, raw := splitClosedOpen(from, to, now)
+	if hasClosed {
+		t.Errorf("expected no closed segment for a single unaligned past day, got %v", closed)
+	}
+	for _, w := range raw {
+		if !w.From.Before(w.To) {
+			t.Errorf("raw window %v is empty or inverted (From must be before To)", w)
+		}
+	}
+	if len(raw) != 1 || !raw[0].From.Equal(from) || !raw[0].To.Equal(to) {
+		t.Errorf("raw = %v, want a single segment %v..%v", raw, from, to)
+	}
+}
+
 func TestSplitClosedOpenSegmentsAreDisjointAndCoverTheWholeRange(t *testing.T) {
 	now := mustParse(t, "2026-07-10T15:00:00Z")
 	from := mustParse(t, "2026-07-01T12:00:00Z")

@@ -65,7 +65,16 @@ func splitClosedOpen(from, to, now time.Time) (closed window, hasClosed bool, ra
 		if !hasClosed && start.Before(alignedFrom) {
 			start = alignedFrom
 		}
-		raw = append(raw, window{From: start, To: to})
+		// start can land at or after `to` when the whole requested range
+		// falls within a single, not-yet-day-aligned past day: the leading
+		// raw segment above already covers [from, to) in full, and
+		// advancing start to alignedFrom for the !hasClosed case can push
+		// it past `to`. Without this guard that would append an inverted
+		// (From > To) window here on top of the leading segment that
+		// already covers the range, double-reporting it.
+		if start.Before(to) {
+			raw = append(raw, window{From: start, To: to})
+		}
 	}
 
 	return closed, hasClosed, raw
