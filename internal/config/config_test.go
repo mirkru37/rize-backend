@@ -62,6 +62,15 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.IdleTimeout != DefaultIdleTimeout {
 		t.Errorf("IdleTimeout = %v, want %v", cfg.IdleTimeout, DefaultIdleTimeout)
 	}
+	if cfg.AuthLockoutThreshold != DefaultAuthLockoutThreshold {
+		t.Errorf("AuthLockoutThreshold = %d, want %d", cfg.AuthLockoutThreshold, DefaultAuthLockoutThreshold)
+	}
+	if cfg.AuthLockoutBaseDuration != DefaultAuthLockoutBaseDuration {
+		t.Errorf("AuthLockoutBaseDuration = %v, want %v", cfg.AuthLockoutBaseDuration, DefaultAuthLockoutBaseDuration)
+	}
+	if cfg.AuthLockoutMaxDuration != DefaultAuthLockoutMaxDuration {
+		t.Errorf("AuthLockoutMaxDuration = %v, want %v", cfg.AuthLockoutMaxDuration, DefaultAuthLockoutMaxDuration)
+	}
 }
 
 func TestLoadEnvOverrides(t *testing.T) {
@@ -74,6 +83,9 @@ func TestLoadEnvOverrides(t *testing.T) {
 	t.Setenv("CORS_ALLOWED_ORIGINS", "https://app.example.com, https://admin.example.com")
 	t.Setenv("RATE_LIMIT_REQUESTS_PER_MINUTE", "42")
 	t.Setenv("SHUTDOWN_TIMEOUT_SECONDS", "30")
+	t.Setenv("AUTH_LOCKOUT_THRESHOLD", "5")
+	t.Setenv("AUTH_LOCKOUT_BASE_DURATION", "1m")
+	t.Setenv("AUTH_LOCKOUT_MAX_DURATION", "2h")
 
 	cfg, err := Load()
 	if err != nil {
@@ -106,6 +118,61 @@ func TestLoadEnvOverrides(t *testing.T) {
 	}
 	if cfg.ShutdownTimeout != 30*time.Second {
 		t.Errorf("ShutdownTimeout = %v, want 30s", cfg.ShutdownTimeout)
+	}
+	if cfg.AuthLockoutThreshold != 5 {
+		t.Errorf("AuthLockoutThreshold = %d, want 5", cfg.AuthLockoutThreshold)
+	}
+	if cfg.AuthLockoutBaseDuration != time.Minute {
+		t.Errorf("AuthLockoutBaseDuration = %v, want 1m", cfg.AuthLockoutBaseDuration)
+	}
+	if cfg.AuthLockoutMaxDuration != 2*time.Hour {
+		t.Errorf("AuthLockoutMaxDuration = %v, want 2h", cfg.AuthLockoutMaxDuration)
+	}
+}
+
+func TestLoadInvalidAuthLockoutThreshold(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+	}{
+		{name: "not a number", value: "not-a-number"},
+		{name: "zero", value: "0"},
+		{name: "negative", value: "-1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv("AUTH_LOCKOUT_THRESHOLD", tt.value)
+
+			if _, err := Load(); err == nil {
+				t.Fatalf("Load() error = nil, want error for AUTH_LOCKOUT_THRESHOLD=%q", tt.value)
+			}
+		})
+	}
+}
+
+func TestLoadInvalidAuthLockoutDurations(t *testing.T) {
+	tests := []struct {
+		name string
+		env  map[string]string
+	}{
+		{name: "base duration not a duration", env: map[string]string{"AUTH_LOCKOUT_BASE_DURATION": "not-a-duration"}},
+		{name: "base duration zero", env: map[string]string{"AUTH_LOCKOUT_BASE_DURATION": "0s"}},
+		{name: "max duration not a duration", env: map[string]string{"AUTH_LOCKOUT_MAX_DURATION": "not-a-duration"}},
+		{name: "max duration zero", env: map[string]string{"AUTH_LOCKOUT_MAX_DURATION": "0s"}},
+		{name: "max duration below base duration", env: map[string]string{"AUTH_LOCKOUT_BASE_DURATION": "1h", "AUTH_LOCKOUT_MAX_DURATION": "30m"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clearEnv(t)
+			for k, v := range tt.env {
+				t.Setenv(k, v)
+			}
+
+			if _, err := Load(); err == nil {
+				t.Fatalf("Load() error = nil, want error for %+v", tt.env)
+			}
+		})
 	}
 }
 

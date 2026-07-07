@@ -115,12 +115,66 @@ func (s *Service) Login(ctx context.Context, email, password string, device Devi
 		return Result{}, ErrInvalidCredentials
 	}
 
+	now := s.now()
+
+	if user.LockedUntil.Valid && user.LockedUntil.Time.After(now) {
+		// RIZ-59: the account is currently locked out from too many
+		// recent failed attempts (documentation/security.md §API
+		// hardening, "brute-force lockout on login"). This branch must be
+		// indistinguishable from a wrong-password failure — same
+		// ErrInvalidCredentials, same RFC 7807 envelope via
+		// writeServiceError, and comparable timing — so it still runs the
+		// real argon2id comparison against the account's actual stored
+		// hash (mirroring the unknown-email/password-less branches'
+		// decoy-hash comparison above) and discards the result, rather
+		// than short-circuiting immediately. The failed-attempt counter is
+		// deliberately NOT incremented here: doing so would let an
+		// attacker keep re-extending their own lockout window
+		// indefinitely by continuing to hit a locked account, which is a
+		// denial-of-service vector against the legitimate user rather
+		// than a defense.
+		_, _ = VerifyPassword(*user.PasswordHash, password)
+		return Result{}, ErrInvalidCredentials
+	}
+
 	ok, err := VerifyPassword(*user.PasswordHash, password)
 	if err != nil {
 		return Result{}, fmt.Errorf("auth: verify password: %w", err)
 	}
 	if !ok {
+		// RIZ-59: atomically record the failed attempt and, if this
+		// attempt reaches the configured threshold, escalate into a
+		// lockout — all inside a single UPDATE so concurrent failed
+		// logins against the same account can't race a
+		// read-modify-write (see login_lockout.sql).
+		if _, recErr := s.Queries.RecordFailedLoginAttempt(ctx, storedb.RecordFailedLoginAttemptParams{
+			ID:                  user.ID,
+			Threshold:           int32(s.lockoutThreshold()), //nolint:gosec // configured, small positive value
+			Now:                 timestamptzNow(now),
+			BaseDurationSeconds: s.lockoutBaseDuration().Seconds(),
+			MaxDurationSeconds:  s.lockoutMaxDuration().Seconds(),
+		}); recErr != nil {
+			return Result{}, fmt.Errorf("auth: record failed login attempt: %w", recErr)
+		}
 		return Result{}, ErrInvalidCredentials
+	}
+
+	if user.FailedLoginAttempts > 0 || user.LockoutCount > 0 {
+		// RIZ-59: a successful login clears both the failed-attempt
+		// counter and any lockout escalation, per
+		// documentation/security.md's reset semantics. user is updated
+		// locally too (not just in the database) so the Result this call
+		// returns reflects the post-reset state rather than the
+		// pre-login snapshot fetched above.
+		if resetErr := s.Queries.ResetLoginLockout(ctx, storedb.ResetLoginLockoutParams{
+			ID:  user.ID,
+			Now: timestamptzNow(now),
+		}); resetErr != nil {
+			return Result{}, fmt.Errorf("auth: reset login lockout: %w", resetErr)
+		}
+		user.FailedLoginAttempts = 0
+		user.LockoutCount = 0
+		user.LockedUntil = pgtype.Timestamptz{}
 	}
 
 	deviceRow, err := s.resolveDevice(ctx, user.ID, device)
