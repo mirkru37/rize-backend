@@ -1,15 +1,21 @@
 package main
 
 import (
+	"context"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/mirkru37/rize-backend/internal/auth"
 	"github.com/mirkru37/rize-backend/internal/config"
+	"github.com/mirkru37/rize-backend/internal/store"
 )
 
 func testConfig() config.Config {
@@ -206,5 +212,140 @@ func TestV1MountExists(t *testing.T) {
 
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+}
+
+// TestReadyzWithDatabase exercises readyzHandler's pool-configured branch
+// (both the "ok" and "unreachable" outcomes), which TestReadyzWithoutDatabase
+// doesn't reach since it passes a nil pool.
+func TestReadyzWithDatabase(t *testing.T) {
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DATABASE_URL not set; skipping DB-backed readyz test")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	pool, err := store.NewPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("store.NewPool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	router := newRouter(slog.Default(), testConfig(), pool)
+
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var got map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if got["db"] != "ok" {
+		t.Errorf(`body["db"] = %q, want "ok"`, got["db"])
+	}
+}
+
+// TestReadyzWithUnreachableDatabase exercises readyzHandler's "unreachable"
+// branch by pointing a pool at a port nothing is listening on and using a
+// short ping timeout, rather than sleeping/waiting on a real timeout.
+func TestReadyzWithUnreachableDatabase(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	// Port 1 is a reserved, never-listened-on port; connection attempts
+	// fail fast (connection refused) rather than needing to actually time
+	// out, keeping this test deterministic and quick.
+	pool, err := store.NewPool(ctx, "postgres://rize:rize@127.0.0.1:1/rize?sslmode=disable")
+	if err != nil {
+		t.Fatalf("store.NewPool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	cfg := testConfig()
+	cfg.ReadyzDBPingTimeout = time.Second
+	router := newRouter(slog.Default(), cfg, pool)
+
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusServiceUnavailable, rec.Body.String())
+	}
+	var got map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if got["db"] != "unreachable" {
+		t.Errorf(`body["db"] = %q, want "unreachable"`, got["db"])
+	}
+}
+
+func pemEncodedRSAKey(t *testing.T) string {
+	t.Helper()
+	key, err := auth.GenerateSigningKey()
+	if err != nil {
+		t.Fatalf("GenerateSigningKey: %v", err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatalf("MarshalPKCS8PrivateKey: %v", err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}))
+}
+
+func TestLoadOrGenerateSigningKey(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     config.Config
+		wantErr bool
+	}{
+		{
+			name: "explicit key is loaded",
+			cfg: config.Config{
+				Environment:   "production",
+				JWTSigningKey: pemEncodedRSAKey(t),
+			},
+			wantErr: false,
+		},
+		{
+			name: "development with no key generates an ephemeral one",
+			cfg: config.Config{
+				Environment: config.DefaultEnvironment,
+			},
+			wantErr: false,
+		},
+		{
+			name: "non-development with no key is a fatal misconfiguration",
+			cfg: config.Config{
+				Environment: "production",
+			},
+			wantErr: true,
+		},
+		{
+			name: "explicit but malformed key fails to load",
+			cfg: config.Config{
+				Environment:   "production",
+				JWTSigningKey: "not a real pem key",
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			key, err := loadOrGenerateSigningKey(tt.cfg)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if !tt.wantErr && key == nil {
+				t.Fatal("expected a non-nil key")
+			}
+		})
 	}
 }

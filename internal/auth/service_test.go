@@ -107,6 +107,130 @@ func TestRegisterLoginRefreshMeHappyPath(t *testing.T) {
 	}
 }
 
+// TestRefreshWithDeviceMetadataUpdatesDevice asserts passing a non-nil
+// DeviceInput to Refresh updates the device row bound to the presented
+// token (refreshNoTx's device-metadata-update branch, otherwise
+// unexercised by every other Refresh(ctx, token, nil) call in this file).
+func TestRefreshWithDeviceMetadataUpdatesDevice(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+	email := uniqueEmail("device-metadata-update")
+
+	registered, err := svc.Register(ctx, email, "correct-horse-battery-staple", testDevice("Old Name"))
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	updatedDevice := testDevice("New Name")
+	updatedDevice.Model = "MacBookPro19,1"
+	refreshed, err := svc.Refresh(ctx, registered.Tokens.RefreshToken, &updatedDevice)
+	if err != nil {
+		t.Fatalf("Refresh with device metadata: %v", err)
+	}
+	if refreshed.Device.Name != "New Name" {
+		t.Errorf("Device.Name = %q, want %q", refreshed.Device.Name, "New Name")
+	}
+	if refreshed.Device.Model != "MacBookPro19,1" {
+		t.Errorf("Device.Model = %q, want %q", refreshed.Device.Model, "MacBookPro19,1")
+	}
+}
+
+// TestRefreshWithInvalidDeviceMetadataRejected asserts a malformed device
+// payload on Refresh is rejected with ErrValidation before any rotation
+// happens.
+func TestRefreshWithInvalidDeviceMetadataRejected(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+	email := uniqueEmail("device-metadata-invalid")
+
+	registered, err := svc.Register(ctx, email, "correct-horse-battery-staple", testDevice("Some Name"))
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	badDevice := testDevice("")
+	if _, err := svc.Refresh(ctx, registered.Tokens.RefreshToken, &badDevice); !errors.Is(err, auth.ErrValidation) {
+		t.Fatalf("Refresh with invalid device metadata = %v, want ErrValidation", err)
+	}
+}
+
+// TestRegisterDeviceValidation is table-driven coverage for every
+// DeviceInput.validate() check (platform, name, model, os_version,
+// app_version), exercised through Register since validate() is
+// unexported.
+func TestRegisterDeviceValidation(t *testing.T) {
+	base := testDevice("Valid Name")
+
+	tests := []struct {
+		name    string
+		mutate  func(d auth.DeviceInput) auth.DeviceInput
+		wantErr bool
+	}{
+		{
+			name:    "valid device",
+			mutate:  func(d auth.DeviceInput) auth.DeviceInput { return d },
+			wantErr: false,
+		},
+		{
+			name: "invalid platform",
+			mutate: func(d auth.DeviceInput) auth.DeviceInput {
+				d.Platform = "windows"
+				return d
+			},
+			wantErr: true,
+		},
+		{
+			name: "blank name",
+			mutate: func(d auth.DeviceInput) auth.DeviceInput {
+				d.Name = "   "
+				return d
+			},
+			wantErr: true,
+		},
+		{
+			name: "blank model",
+			mutate: func(d auth.DeviceInput) auth.DeviceInput {
+				d.Model = ""
+				return d
+			},
+			wantErr: true,
+		},
+		{
+			name: "blank os_version",
+			mutate: func(d auth.DeviceInput) auth.DeviceInput {
+				d.OSVersion = ""
+				return d
+			},
+			wantErr: true,
+		},
+		{
+			name: "blank app_version",
+			mutate: func(d auth.DeviceInput) auth.DeviceInput {
+				d.AppVersion = ""
+				return d
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			svc, _ := newTestService(t)
+			ctx := context.Background()
+			device := tt.mutate(base)
+
+			_, err := svc.Register(ctx, uniqueEmail("device-validation"), "correct-horse-battery-staple", device)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Register() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr && !errors.Is(err, auth.ErrValidation) {
+				t.Errorf("error = %v, want ErrValidation", err)
+			}
+		})
+	}
+}
+
 // TestRefreshRotation_OldTokenInvalidAfterRotation asserts that once a
 // refresh token has been used, it cannot be used again (except to trigger
 // reuse detection), per documentation/security.md's rotation flow.
@@ -427,6 +551,36 @@ func TestValidPasswordLength(t *testing.T) {
 				t.Fatalf("Register with a %d-byte password failed: %v", len(tt.password), err)
 			}
 		})
+	}
+}
+
+// TestLoginWithUnknownDeviceIDFallsBackToCreate asserts resolveDevice's
+// fallback branch: a device.ID that doesn't resolve to a live device owned
+// by the account (unknown/foreign id) falls through to creating a new
+// device row instead of erroring, rather than the "reconnect to an
+// existing device" branch TestLoginTwiceSameDevice_* exercises.
+func TestLoginWithUnknownDeviceIDFallsBackToCreate(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+	email := uniqueEmail("unknown-device-id")
+
+	registered, err := svc.Register(ctx, email, "correct-horse-battery-staple", testDevice("Original MacBook"))
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	bogusDevice := testDevice("Reconnect Attempt")
+	bogusDevice.ID = "00000000-0000-0000-0000-000000000000"
+
+	loggedIn, err := svc.Login(ctx, email, "correct-horse-battery-staple", bogusDevice)
+	if err != nil {
+		t.Fatalf("Login with unknown device.ID: %v", err)
+	}
+	if loggedIn.Device.ID == registered.Device.ID {
+		t.Error("Login with an unknown device.ID reused the original device instead of creating a new one")
+	}
+	if loggedIn.Device.Name != "Reconnect Attempt" {
+		t.Errorf("Device.Name = %q, want %q", loggedIn.Device.Name, "Reconnect Attempt")
 	}
 }
 

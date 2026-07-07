@@ -2,12 +2,14 @@ package auth_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/mirkru37/rize-backend/internal/auth"
 	appmw "github.com/mirkru37/rize-backend/internal/middleware"
@@ -255,6 +257,341 @@ func TestHTTP_DeviceTenantIsolation(t *testing.T) {
 	listRec := doJSON(t, r, http.MethodGet, "/v1/devices", nil, aAccessToken)
 	if listRec.Code != http.StatusOK {
 		t.Fatalf("A's device list status = %d, body = %s", listRec.Code, listRec.Body.String())
+	}
+}
+
+// TestHTTP_PatchMeUpdatesProfile asserts PATCH /v1/users/me updates the
+// authenticated user's own profile fields and that a subsequent GET
+// reflects the change.
+func TestHTTP_PatchMeUpdatesProfile(t *testing.T) {
+	r, _, _ := newTestRouter(t)
+
+	regRec := doJSON(t, r, http.MethodPost, "/v1/auth/register", map[string]any{
+		"email":    uniqueEmail("http-patchme"),
+		"password": "correct-horse-battery-staple",
+		"device":   registerDeviceBody("PatchMe's MacBook"),
+	}, "")
+	regBody := decodeAuthResponse(t, regRec)
+	accessToken, _ := regBody["access_token"].(string)
+
+	patchRec := doJSON(t, r, http.MethodPatch, "/v1/users/me", map[string]any{
+		"display_name": "New Display Name",
+		"timezone":     "America/New_York",
+	}, accessToken)
+	if patchRec.Code != http.StatusOK {
+		t.Fatalf("patch status = %d, body = %s", patchRec.Code, patchRec.Body.String())
+	}
+	patchBody := decodeAuthResponse(t, patchRec)
+	if patchBody["display_name"] != "New Display Name" {
+		t.Errorf("display_name = %v, want %q", patchBody["display_name"], "New Display Name")
+	}
+
+	meRec := doJSON(t, r, http.MethodGet, "/v1/users/me", nil, accessToken)
+	meBody := decodeAuthResponse(t, meRec)
+	if meBody["display_name"] != "New Display Name" {
+		t.Errorf("GET /v1/users/me display_name = %v, want %q", meBody["display_name"], "New Display Name")
+	}
+}
+
+// TestHTTP_PatchMeBlankFieldsRejected is table-driven coverage for
+// UpdateProfile's blank-display_name and blank-timezone validation
+// branches, neither reached by TestHTTP_PatchMeUpdatesProfile's non-blank
+// update.
+func TestHTTP_PatchMeBlankFieldsRejected(t *testing.T) {
+	tests := []struct {
+		name  string
+		patch map[string]any
+	}{
+		{name: "blank display_name", patch: map[string]any{"display_name": "   "}},
+		{name: "blank timezone", patch: map[string]any{"timezone": "   "}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, _, _ := newTestRouter(t)
+
+			regRec := doJSON(t, r, http.MethodPost, "/v1/auth/register", map[string]any{
+				"email":    uniqueEmail("http-patchme-blank"),
+				"password": "correct-horse-battery-staple",
+				"device":   registerDeviceBody("Blank Field's MacBook"),
+			}, "")
+			regBody := decodeAuthResponse(t, regRec)
+			accessToken, _ := regBody["access_token"].(string)
+
+			rec := doJSON(t, r, http.MethodPatch, "/v1/users/me", tt.patch, accessToken)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+// TestHTTP_PatchMeUnauthenticated asserts PATCH /v1/users/me requires a
+// bearer token.
+func TestHTTP_PatchMeUnauthenticated(t *testing.T) {
+	r, _, _ := newTestRouter(t)
+
+	rec := doJSON(t, r, http.MethodPatch, "/v1/users/me", map[string]any{"display_name": "x"}, "")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestHTTP_PatchMeInvalidJSONBody asserts a malformed body is rejected
+// with 400 rather than reaching the service layer.
+func TestHTTP_PatchMeInvalidJSONBody(t *testing.T) {
+	r, _, _ := newTestRouter(t)
+
+	regRec := doJSON(t, r, http.MethodPost, "/v1/auth/register", map[string]any{
+		"email":    uniqueEmail("http-patchme-badjson"),
+		"password": "correct-horse-battery-staple",
+		"device":   registerDeviceBody("Bad JSON's MacBook"),
+	}, "")
+	regBody := decodeAuthResponse(t, regRec)
+	accessToken, _ := regBody["access_token"].(string)
+
+	req := httptest.NewRequest(http.MethodPatch, "/v1/users/me", bytes.NewBufferString("{not-json"))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestHTTP_PatchDeviceOwnDeviceSucceeds asserts a user can rename their
+// own device via PATCH /v1/devices/{id}.
+func TestHTTP_PatchDeviceOwnDeviceSucceeds(t *testing.T) {
+	r, _, _ := newTestRouter(t)
+
+	regRec := doJSON(t, r, http.MethodPost, "/v1/auth/register", map[string]any{
+		"email":    uniqueEmail("http-renamedevice"),
+		"password": "correct-horse-battery-staple",
+		"device":   registerDeviceBody("Original Name"),
+	}, "")
+	regBody := decodeAuthResponse(t, regRec)
+	accessToken, _ := regBody["access_token"].(string)
+	device, _ := regBody["device"].(map[string]any)
+	deviceID, _ := device["id"].(string)
+
+	rec := doJSON(t, r, http.MethodPatch, "/v1/devices/"+deviceID, map[string]any{"name": "Renamed Device"}, accessToken)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	body := decodeAuthResponse(t, rec)
+	if body["name"] != "Renamed Device" {
+		t.Errorf("name = %v, want %q", body["name"], "Renamed Device")
+	}
+}
+
+// TestHTTP_DeleteDeviceOwnDeviceSucceeds asserts a user can revoke their
+// own device via DELETE /v1/devices/{id}, and it no longer appears in
+// ListDevices afterward.
+func TestHTTP_DeleteDeviceOwnDeviceSucceeds(t *testing.T) {
+	r, _, _ := newTestRouter(t)
+
+	regRec := doJSON(t, r, http.MethodPost, "/v1/auth/register", map[string]any{
+		"email":    uniqueEmail("http-deletedevice"),
+		"password": "correct-horse-battery-staple",
+		"device":   registerDeviceBody("Doomed Device"),
+	}, "")
+	regBody := decodeAuthResponse(t, regRec)
+	accessToken, _ := regBody["access_token"].(string)
+	device, _ := regBody["device"].(map[string]any)
+	deviceID, _ := device["id"].(string)
+
+	rec := doJSON(t, r, http.MethodDelete, "/v1/devices/"+deviceID, nil, accessToken)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	listRec := doJSON(t, r, http.MethodGet, "/v1/devices", nil, accessToken)
+	listBody := decodeAuthResponse(t, listRec)
+	devices, _ := listBody["devices"].([]any)
+	for _, d := range devices {
+		dm, _ := d.(map[string]any)
+		if dm["id"] == deviceID {
+			t.Fatal("revoked device still appears in ListDevices")
+		}
+	}
+}
+
+// TestHTTP_RegisterDuplicateEmailConflict asserts registering a second
+// account with an already-registered email returns 409 (ErrEmailTaken),
+// exercising that writeServiceError branch.
+func TestHTTP_RegisterDuplicateEmailConflict(t *testing.T) {
+	r, _, _ := newTestRouter(t)
+	email := uniqueEmail("http-dup")
+
+	first := doJSON(t, r, http.MethodPost, "/v1/auth/register", map[string]any{
+		"email":    email,
+		"password": "correct-horse-battery-staple",
+		"device":   registerDeviceBody("First MacBook"),
+	}, "")
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first register status = %d, body = %s", first.Code, first.Body.String())
+	}
+
+	second := doJSON(t, r, http.MethodPost, "/v1/auth/register", map[string]any{
+		"email":    email,
+		"password": "a-different-password",
+		"device":   registerDeviceBody("Second MacBook"),
+	}, "")
+	if second.Code != http.StatusConflict {
+		t.Fatalf("second register status = %d, want 409, body = %s", second.Code, second.Body.String())
+	}
+}
+
+// TestHTTP_LogoutInvalidRefreshToken asserts logging out with a
+// well-formed-but-unknown refresh token surfaces the service's error
+// through writeServiceError rather than succeeding.
+func TestHTTP_LogoutInvalidRefreshToken(t *testing.T) {
+	r, _, _ := newTestRouter(t)
+
+	regRec := doJSON(t, r, http.MethodPost, "/v1/auth/register", map[string]any{
+		"email":    uniqueEmail("http-logout-bad-token"),
+		"password": "correct-horse-battery-staple",
+		"device":   registerDeviceBody("Logout Bad Token's MacBook"),
+	}, "")
+	regBody := decodeAuthResponse(t, regRec)
+	accessToken, _ := regBody["access_token"].(string)
+
+	notARealToken := "rt_not-a-real-token" //nolint:gosec // test fixture, not a real credential
+	rec := doJSON(t, r, http.MethodPost, "/v1/auth/logout", map[string]any{
+		"refresh_token": notARealToken,
+	}, accessToken)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestHTTP_PatchDeviceNotFound asserts PATCH /v1/devices/{id} with an id
+// that doesn't resolve to any device (owned or otherwise) returns 404.
+func TestHTTP_PatchDeviceNotFound(t *testing.T) {
+	r, _, _ := newTestRouter(t)
+
+	regRec := doJSON(t, r, http.MethodPost, "/v1/auth/register", map[string]any{
+		"email":    uniqueEmail("http-patchdevice-404"),
+		"password": "correct-horse-battery-staple",
+		"device":   registerDeviceBody("404 Patch's MacBook"),
+	}, "")
+	regBody := decodeAuthResponse(t, regRec)
+	accessToken, _ := regBody["access_token"].(string)
+
+	rec := doJSON(t, r, http.MethodPatch, "/v1/devices/00000000-0000-0000-0000-000000000000", map[string]any{
+		"name": "doesn't matter",
+	}, accessToken)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestHTTP_PatchDeviceBlankNameRejected asserts PATCH /v1/devices/{id}
+// rejects a blank name (RenameDevice's validation branch).
+func TestHTTP_PatchDeviceBlankNameRejected(t *testing.T) {
+	r, _, _ := newTestRouter(t)
+
+	regRec := doJSON(t, r, http.MethodPost, "/v1/auth/register", map[string]any{
+		"email":    uniqueEmail("http-patchdevice-blank"),
+		"password": "correct-horse-battery-staple",
+		"device":   registerDeviceBody("Blank Name's MacBook"),
+	}, "")
+	regBody := decodeAuthResponse(t, regRec)
+	accessToken, _ := regBody["access_token"].(string)
+	device, _ := regBody["device"].(map[string]any)
+	deviceID, _ := device["id"].(string)
+
+	rec := doJSON(t, r, http.MethodPatch, "/v1/devices/"+deviceID, map[string]any{"name": "   "}, accessToken)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestHandler_AuthenticatedRoutesWithoutMiddleware calls every handler
+// method that requires an authenticated identity directly, bypassing the
+// Authenticate middleware entirely, to exercise each handler's own
+// defense-in-depth identity check (every other test in this file goes
+// through the real middleware, which already rejects an unauthenticated
+// request before the handler method itself ever runs).
+func TestHandler_AuthenticatedRoutesWithoutMiddleware(t *testing.T) {
+	_, svc, _ := newTestRouter(t)
+	h := auth.NewHandler(svc)
+
+	tests := []struct {
+		name string
+		call func(w http.ResponseWriter, r *http.Request)
+	}{
+		{"GetMe", h.GetMe},
+		{"PatchMe", h.PatchMe},
+		{"ListDevices", h.ListDevices},
+		{"PatchDevice", h.PatchDevice},
+		{"DeleteDevice", h.DeleteDevice},
+		{"Logout", h.Logout},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			rec := httptest.NewRecorder()
+			tt.call(rec, req)
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401, body = %s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+// TestHTTP_GetMeWrapsUnexpectedDatabaseError exercises GetMe's
+// writeServiceError branch for an unexpected (non-ErrUserNotFound) service
+// failure.
+func TestHTTP_GetMeWrapsUnexpectedDatabaseError(t *testing.T) {
+	r, svc, _ := newTestRouter(t)
+	fq := svc.Queries.(*fakeQuerier)
+
+	regRec := doJSON(t, r, http.MethodPost, "/v1/auth/register", map[string]any{
+		"email":    uniqueEmail("http-getme-dberr"),
+		"password": "correct-horse-battery-staple",
+		"device":   registerDeviceBody("MacBook"),
+	}, "")
+	regBody := decodeAuthResponse(t, regRec)
+	accessToken, _ := regBody["access_token"].(string)
+
+	fq.failNextCallTo("GetUserByID", errInjectedDBFailure)
+	rec := doJSON(t, r, http.MethodGet, "/v1/users/me", nil, accessToken)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestHTTP_GetMeUserNotFound exercises writeServiceError's ErrUserNotFound
+// branch: a valid access token whose subject no longer resolves to a live
+// user (e.g. the account was deleted after the token was issued).
+func TestHTTP_GetMeUserNotFound(t *testing.T) {
+	r, svc, _ := newTestRouter(t)
+
+	regRec := doJSON(t, r, http.MethodPost, "/v1/auth/register", map[string]any{
+		"email":    uniqueEmail("http-getme-deleted"),
+		"password": "correct-horse-battery-staple",
+		"device":   registerDeviceBody("MacBook"),
+	}, "")
+	regBody := decodeAuthResponse(t, regRec)
+	accessToken, _ := regBody["access_token"].(string)
+	user, _ := regBody["user"].(map[string]any)
+	userID, _ := user["id"].(string)
+
+	var uid pgtype.UUID
+	if err := uid.Scan(userID); err != nil {
+		t.Fatalf("parse user id: %v", err)
+	}
+	if err := svc.Queries.SoftDeleteUser(context.Background(), uid); err != nil {
+		t.Fatalf("SoftDeleteUser: %v", err)
+	}
+
+	rec := doJSON(t, r, http.MethodGet, "/v1/users/me", nil, accessToken)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404, body = %s", rec.Code, rec.Body.String())
 	}
 }
 
