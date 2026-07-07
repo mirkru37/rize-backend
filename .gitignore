@@ -26,5 +26,10 @@ coverage.html
 .idea/
 .vscode/
 
+# RIZ-51: rendered API docs site (built by `make api-docs` / the
+# api-docs/deploy-docs CI workflows from openapi/openapi.yaml — never
+# committed, only published to GitHub Pages on push to main)
+/site/
+
 # OS
 .DS_Store
