@@ -83,6 +83,27 @@ func serve(ctx context.Context, logger *slog.Logger, cfg config.Config, pool *pg
 		IdleTimeout:       cfg.IdleTimeout,
 	}
 
+	// RIZ-72: the sync_changelog retention pruner runs as its own
+	// in-process ticker goroutine, independent of any HTTP request path —
+	// see internal/sync.Pruner's doc comment for why a periodic background
+	// job was chosen over amortizing pruning onto every push/pull request.
+	// It is simply not started when pool is nil (no database configured,
+	// e.g. local scaffolding), matching every other pool-dependent service
+	// in newRouter. It stops on its own once ctx is done (Pruner.Run),
+	// so it needs no explicit shutdown/join here — a maintenance job
+	// dying mid-tick on process shutdown is harmless (its transaction
+	// simply never commits, per PruneOnce's rollback-by-default deferred
+	// cleanup).
+	if pool != nil {
+		pruner := &sync.Pruner{
+			Pool:      pool,
+			MaxAge:    cfg.SyncChangelogMaxAge,
+			BatchSize: cfg.SyncChangelogPruneBatchSize,
+			Logger:    logger,
+		}
+		go pruner.Run(ctx, cfg.SyncChangelogPruneInterval)
+	}
+
 	errCh := make(chan error, 1)
 	go func() {
 		logger.Info("starting server", "addr", srv.Addr, "environment", cfg.Environment)
