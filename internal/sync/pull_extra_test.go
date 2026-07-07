@@ -265,3 +265,113 @@ func TestPullFocusSessionIncludesEndedAt(t *testing.T) {
 		t.Fatalf("pulled focus sessions did not include %s", sessionID)
 	}
 }
+
+// TestPullTagTombstoneDelivery soft-deletes a tag and asserts it's
+// delivered as a tombstone (not an upsert) on the next pull, exercising
+// resolveChangelogEntry's "tags" tombstone branch — every other tags pull
+// test in this package only exercises the upsert branch.
+func TestPullTagTombstoneDelivery(t *testing.T) {
+	pool := testPool(t)
+	q := storedb.New(pool)
+	user, _ := newUser(t, q)
+	svc := &Service{Queries: q, Pool: pool}
+	ctx := context.Background()
+	suffix := randomSuffix(t)
+
+	tagID := newUUIDv7(t)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO tags (id, user_id, name, updated_at)
+		VALUES ($1, $2, $3, now())`,
+		mustParseUUID(t, tagID), user.ID, "pull-tombstone-test-tag-"+suffix,
+	); err != nil {
+		t.Fatalf("insert tag: %v", err)
+	}
+
+	first, err := svc.pull(ctx, userIDString(user), "", 0)
+	if err != nil {
+		t.Fatalf("pull (before delete): %v", err)
+	}
+	foundUpsert := false
+	for _, u := range first.Changes["tags"].Upserts {
+		if dto, ok := u.(tagUpsertDTO); ok && dto.ID == tagID {
+			foundUpsert = true
+		}
+	}
+	if !foundUpsert {
+		t.Fatalf("first pull did not include tag %s as an upsert", tagID)
+	}
+
+	if _, err := q.SoftDeleteTagForUser(ctx, storedb.SoftDeleteTagForUserParams{ID: mustParseUUID(t, tagID), UserID: user.ID}); err != nil {
+		t.Fatalf("SoftDeleteTagForUser: %v", err)
+	}
+
+	second, err := svc.pull(ctx, userIDString(user), first.NextCursor, 0)
+	if err != nil {
+		t.Fatalf("pull (after delete): %v", err)
+	}
+	foundTombstone := false
+	for _, ts := range second.Changes["tags"].Tombstones {
+		if dto, ok := ts.(tagTombstoneDTO); ok && dto.ID == tagID {
+			foundTombstone = true
+		}
+	}
+	if !foundTombstone {
+		t.Fatalf("second pull did not include tag %s as a tombstone: %+v", tagID, second.Changes["tags"])
+	}
+}
+
+// TestPullUserAppSettingIncludesCategoryOverride inserts a
+// user_app_settings row directly (there is no push-side path for this
+// entity, per doc.go) and asserts it's delivered as an upsert with its
+// category_id set, exercising resolveChangelogEntry's "user_app_settings"
+// branch, which no other test in this package reaches.
+func TestPullUserAppSettingIncludesCategoryOverride(t *testing.T) {
+	pool := testPool(t)
+	q := storedb.New(pool)
+	user, _ := newUser(t, q)
+	svc := &Service{Queries: q, Pool: pool}
+	ctx := context.Background()
+	suffix := randomSuffix(t)
+
+	app, err := q.CreateApp(ctx, storedb.CreateAppParams{BundleID: "com.example.uas-pull." + suffix, Platform: "macos", Name: "UAS Pull App"})
+	if err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+	category, err := q.CreateCategoryForUser(ctx, storedb.CreateCategoryForUserParams{
+		UserID: user.ID, Name: "UAS Pull Category " + suffix, Color: "#abcdef", Productivity: 1,
+	})
+	if err != nil {
+		t.Fatalf("CreateCategoryForUser: %v", err)
+	}
+
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO user_app_settings (user_id, app_id, category_id, excluded, updated_at, server_seq)
+		VALUES ($1, $2, $3, false, now(), nextval('server_seq_global'))`,
+		user.ID, app.ID, category.ID,
+	); err != nil {
+		t.Fatalf("insert user_app_settings: %v", err)
+	}
+
+	resp, err := svc.pull(ctx, userIDString(user), "", 0)
+	if err != nil {
+		t.Fatalf("pull: %v", err)
+	}
+
+	found := false
+	for _, u := range resp.Changes["user_app_settings"].Upserts {
+		dto, ok := u.(userAppSettingUpsertDTO)
+		if !ok {
+			t.Fatalf("user_app_settings upsert is not a userAppSettingUpsertDTO: %T", u)
+		}
+		if dto.AppID != app.ID.String() {
+			continue
+		}
+		found = true
+		if dto.CategoryID == nil || *dto.CategoryID != category.ID.String() {
+			t.Errorf("category_id = %v, want %q", dto.CategoryID, category.ID.String())
+		}
+	}
+	if !found {
+		t.Fatalf("pulled user_app_settings did not include app %s: %+v", app.ID.String(), resp.Changes["user_app_settings"])
+	}
+}

@@ -116,6 +116,35 @@ func TestRefreshTxWithDeviceMetadataUpdate(t *testing.T) {
 	}
 }
 
+// TestRefreshTxExpiredToken exercises refreshTx's expired-token branch
+// against a real transaction (TestRefreshExpired in service_test.go only
+// covers the fakeQuerier/refreshNoTx path): the token's expires_at is
+// backdated directly via SQL (RefreshTokenTTL is 30 days, too long to
+// wait out in a test), then Refresh must reject it as
+// ErrInvalidRefreshToken without rotating it.
+func TestRefreshTxExpiredToken(t *testing.T) {
+	pool := testDBPool(t)
+	svc := newDBBackedTestService(t, pool)
+	ctx := context.Background()
+
+	registered, err := svc.Register(ctx, uniqueEmail("refresh-tx-expired"), "correct-horse-battery-staple", testDevice("Expired Tx's MacBook"))
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	if _, err := pool.Exec(ctx, `
+		UPDATE refresh_tokens SET expires_at = now() - interval '1 hour'
+		WHERE user_id = $1 AND revoked_at IS NULL`,
+		registered.User.ID,
+	); err != nil {
+		t.Fatalf("backdate refresh token expiry: %v", err)
+	}
+
+	if _, err := svc.Refresh(ctx, registered.Tokens.RefreshToken, nil); !errors.Is(err, auth.ErrInvalidRefreshToken) {
+		t.Fatalf("Refresh (expired, Tx path) = %v, want ErrInvalidRefreshToken", err)
+	}
+}
+
 // TestUpdateProfileAgainstRealDatabase exercises Service.UpdateProfile
 // against a real database, complementing service_test.go's fakeQuerier
 // coverage of the same method.

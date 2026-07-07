@@ -418,6 +418,66 @@ func TestHTTP_DeleteDeviceOwnDeviceSucceeds(t *testing.T) {
 	}
 }
 
+// TestHTTP_RegisterLoginRefreshInvalidJSONBody is table-driven coverage
+// for each endpoint's decodeJSON-failure branch, which no other test in
+// this file reaches for Register/Login/Refresh specifically (only PatchMe
+// has an equivalent case).
+func TestHTTP_RegisterLoginRefreshInvalidJSONBody(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+	}{
+		{name: "register", path: "/v1/auth/register"},
+		{name: "login", path: "/v1/auth/login"},
+		{name: "refresh", path: "/v1/auth/refresh"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, _, _ := newTestRouter(t)
+
+			req := httptest.NewRequest(http.MethodPost, tt.path, bytes.NewBufferString("{not-json"))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+// TestHTTP_RefreshWithDeviceMetadataUpdatesDevice exercises Refresh's
+// req.Device != nil branch (updating the device's metadata as part of the
+// refresh call), which TestHTTP_RegisterLoginRefreshMe's device-less
+// refresh never reaches.
+func TestHTTP_RefreshWithDeviceMetadataUpdatesDevice(t *testing.T) {
+	r, _, _ := newTestRouter(t)
+	email := uniqueEmail("http-refresh-device")
+
+	registerRec := doJSON(t, r, http.MethodPost, "/v1/auth/register", map[string]any{
+		"email":    email,
+		"password": "correct-horse-battery-staple",
+		"device":   registerDeviceBody("Old Name"),
+	}, "")
+	registerBody := decodeAuthResponse(t, registerRec)
+	refreshToken, _ := registerBody["refresh_token"].(string)
+
+	refreshRec := doJSON(t, r, http.MethodPost, "/v1/auth/refresh", map[string]any{
+		"refresh_token": refreshToken,
+		"device":        registerDeviceBody("New Name"),
+	}, "")
+	if refreshRec.Code != http.StatusOK {
+		t.Fatalf("refresh status = %d, body = %s", refreshRec.Code, refreshRec.Body.String())
+	}
+	refreshBody := decodeAuthResponse(t, refreshRec)
+	device, _ := refreshBody["device"].(map[string]any)
+	if device["name"] != "New Name" {
+		t.Errorf("device.name = %v, want %q", device["name"], "New Name")
+	}
+}
+
 // TestHTTP_RegisterDuplicateEmailConflict asserts registering a second
 // account with an already-registered email returns 409 (ErrEmailTaken),
 // exercising that writeServiceError branch.

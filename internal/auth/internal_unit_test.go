@@ -4,9 +4,18 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
+
+// Note: newUUIDv4/GenerateSigningKey/GenerateRefreshToken's rand-failure
+// branches are intentionally not covered here. As of Go 1.24,
+// crypto/rand.Read calls runtime.fatal (aborting the whole process, not
+// returning an error) when the OS entropy source fails, so those
+// defensive "if err != nil" branches are unreachable without crashing the
+// test binary — confirmed by attempting exactly that and observing the
+// fatal error above rather than a returned error.
 
 func TestStrPtr(t *testing.T) {
 	if got := strPtr(""); got != nil {
@@ -100,6 +109,48 @@ func TestVerifyPasswordInternal(t *testing.T) {
 			}
 			if !tt.wantErr && got != tt.want {
 				t.Errorf("VerifyPassword() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestVerifyPasswordMalformedHashFormats is table-driven coverage for
+// every distinct malformed-encoding branch VerifyPassword checks, beyond
+// the single "obviously not a hash" case TestVerifyPasswordInternal
+// covers.
+func TestVerifyPasswordMalformedHashFormats(t *testing.T) {
+	valid, err := HashPassword("correct-horse-battery-staple")
+	if err != nil {
+		t.Fatalf("HashPassword: %v", err)
+	}
+	parts := strings.Split(valid, "$")
+	if len(parts) != 6 {
+		t.Fatalf("HashPassword produced %d parts, want 6: %q", len(parts), valid)
+	}
+
+	replace := func(i int, v string) string {
+		p := append([]string{}, parts...)
+		p[i] = v
+		return strings.Join(p, "$")
+	}
+
+	tests := []struct {
+		name string
+		hash string
+	}{
+		{name: "wrong algorithm tag", hash: replace(1, "bcrypt")},
+		{name: "malformed version segment", hash: replace(2, "not-a-version")},
+		{name: "malformed params segment", hash: replace(3, "not-params")},
+		{name: "malformed salt base64", hash: replace(4, "not valid base64!!!")},
+		{name: "malformed hash base64", hash: replace(5, "not valid base64!!!")},
+		{name: "empty hash segment", hash: replace(5, "")},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := VerifyPassword(tt.hash, "anything"); !errors.Is(err, ErrInvalidPasswordHash) {
+				t.Errorf("VerifyPassword() error = %v, want ErrInvalidPasswordHash", err)
 			}
 		})
 	}

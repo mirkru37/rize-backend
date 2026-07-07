@@ -11,17 +11,10 @@ permissions:
 
 env:
   # RIZ-69: single knob for the total-statement coverage gate enforced by
-  # the Test job below. The ticket's original target was 90%; actual
-  # first-party coverage after this ticket's test additions is ~85% (up
-  # from a ~50% baseline — see the PR description for the per-package
-  # breakdown). The threshold was set to 80% with explicit sign-off
-  # (leaving comfortable headroom above the current number) rather than
-  # continuing to chase the last few points across the hardest-to-test
-  # packages (auth's tx-based refresh path, sync's cagg/pull edge cases,
-  # cmd/api's process bootstrap). Raise this over time as coverage
-  # improves; never lower it (or widen the exclusion list below) just to
-  # make a red run pass — add tests instead.
-  COVERAGE_THRESHOLD: 80
+  # the Test job below. Raise this over time as coverage improves; never
+  # lower it (or widen the exclusion list below) just to make a red run
+  # pass — add tests instead.
+  COVERAGE_THRESHOLD: 90
 
 jobs:
   lint:

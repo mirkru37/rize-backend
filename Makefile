@@ -2,10 +2,8 @@
 
 # RIZ-69: single source of truth for the minimum acceptable total statement
 # coverage, mirrored by .github/workflows/ci.yml's COVERAGE_THRESHOLD env
-# var (see that file's comment for why this is 80, not the ticket's
-# original 90, target). Override locally with `make coverage
-# COVERAGE_THRESHOLD=95`.
-COVERAGE_THRESHOLD ?= 80
+# var. Override locally with `make coverage COVERAGE_THRESHOLD=95`.
+COVERAGE_THRESHOLD ?= 90
 
 build:
 	go build ./...

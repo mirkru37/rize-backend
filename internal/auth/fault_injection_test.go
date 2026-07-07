@@ -126,6 +126,45 @@ func TestRegisterWrapsUnexpectedDatabaseErrors(t *testing.T) {
 	}
 }
 
+// TestLoginWrapsResolveDeviceUpdateError exercises resolveDevice's own
+// UpdateDeviceMetadata-failure branch (the "reconnect to an existing
+// device by id" path), distinct from refreshNoTx's/refreshTx's use of the
+// same method for a different purpose.
+func TestLoginWrapsResolveDeviceUpdateError(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+	fq := svc.Queries.(*fakeQuerier)
+
+	email := uniqueEmail("resolvedevice-dberr")
+	registered, err := svc.Register(ctx, email, "correct-horse-battery-staple", testDevice("Original Name"))
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	reconnectDevice := testDevice("Reconnect Attempt")
+	reconnectDevice.ID = registered.Device.ID.String()
+
+	fq.failNextCallTo("UpdateDeviceMetadata", errInjectedDBFailure)
+	if _, err := svc.Login(ctx, email, "correct-horse-battery-staple", reconnectDevice); err == nil {
+		t.Fatal("Login with an injected UpdateDeviceMetadata failure = nil, want an error")
+	}
+}
+
+// TestRegisterWrapsIssueTokenPairRevokeError exercises issueTokenPair's
+// own RevokeRefreshTokensByDevice-failure branch (distinct from
+// revokeDeviceNoTx's use of the same method, covered by
+// TestRevokeDeviceNoTxWrapsUnexpectedDatabaseErrors).
+func TestRegisterWrapsIssueTokenPairRevokeError(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+	fq := svc.Queries.(*fakeQuerier)
+
+	fq.failNextCallTo("RevokeRefreshTokensByDevice", errInjectedDBFailure)
+	if _, err := svc.Register(ctx, uniqueEmail("issuetokenpair-dberr"), "correct-horse-battery-staple", testDevice("MacBook")); err == nil {
+		t.Fatal("Register with an injected RevokeRefreshTokensByDevice failure = nil, want an error")
+	}
+}
+
 func TestRefreshNoTxWrapsUnexpectedDatabaseErrors(t *testing.T) {
 	tests := []string{"GetUserByID", "GetDeviceByID", "CreateRefreshToken"}
 

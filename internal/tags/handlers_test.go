@@ -92,6 +92,20 @@ func randomSuffix(t *testing.T) string {
 
 func textPtr(s string) *string { return &s }
 
+// randomUUIDv4ForTest returns a fresh random UUIDv4 string, so tests that
+// need a specific (but collision-free across repeated runs against a
+// long-lived database) id don't hardcode a literal.
+func randomUUIDv4ForTest(t *testing.T) string {
+	t.Helper()
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		t.Fatalf("rand.Read: %v", err)
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
 func doJSON(t *testing.T, r http.Handler, method, path string, body any, bearer string) *httptest.ResponseRecorder {
 	t.Helper()
 	var buf bytes.Buffer
@@ -194,6 +208,35 @@ func TestHTTP_TagsCreateValidationError(t *testing.T) {
 	r, _, token := newTestRouter(t, q)
 
 	rec := doJSON(t, r, http.MethodPost, "/v1/tags/", map[string]any{"name": "  "}, token)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestHTTP_TagsCreateWithExplicitID exercises Create's req.ID-provided
+// branch (both success with a valid id, and rejection of a malformed
+// one), which TestHTTP_TagsCRUDHappyPath's server-generated-id create
+// never reaches.
+func TestHTTP_TagsCreateWithExplicitID(t *testing.T) {
+	q := testQueries(t)
+	r, _, token := newTestRouter(t, q)
+
+	explicitID := randomUUIDv4ForTest(t)
+	rec := doJSON(t, r, http.MethodPost, "/v1/tags/", map[string]any{"id": explicitID, "name": "explicit-id-tag"}, token)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	body := decodeBody(t, rec)
+	if body["id"] != explicitID {
+		t.Errorf("id = %v, want %q", body["id"], explicitID)
+	}
+}
+
+func TestHTTP_TagsCreateMalformedExplicitIDRejected(t *testing.T) {
+	q := testQueries(t)
+	r, _, token := newTestRouter(t, q)
+
+	rec := doJSON(t, r, http.MethodPost, "/v1/tags/", map[string]any{"id": "not-a-uuid", "name": "bad-id-tag"}, token)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
 	}

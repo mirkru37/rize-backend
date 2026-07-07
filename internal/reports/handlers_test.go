@@ -162,6 +162,57 @@ func TestHTTP_ReportsDailyInvalidDate(t *testing.T) {
 	}
 }
 
+// TestHTTP_ReportsDailyInvalidPrecision exercises Daily's own
+// f.validatePrecision() call, distinct from Categories'/Apps' equivalent
+// checks (which run inside categoryTotals/appTotals's raw-fallback path
+// instead).
+func TestHTTP_ReportsDailyInvalidPrecision(t *testing.T) {
+	r, token := newReportsTestRouter(t)
+
+	rec := doReportsReq(t, r, "/v1/reports/daily?date=2024-01-01&precision=bogus", token)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestHTTP_ReportsProjectsInvalidPrecisionFilter exercises rawTotals'
+// precision-validation branch via the always-raw Projects endpoint (the
+// Apps equivalent test covers appTotals' raw-fallback dispatch instead).
+func TestHTTP_ReportsProjectsInvalidPrecisionFilter(t *testing.T) {
+	r, token := newReportsTestRouter(t)
+
+	rec := doReportsReq(t, r, "/v1/reports/projects?from=2024-01-01T00:00:00Z&to=2024-01-02T00:00:00Z&precision=bogus", token)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestHTTP_ReportsTimelineInvalidFilters is table-driven coverage for
+// Timeline's filter-validation branches.
+func TestHTTP_ReportsTimelineInvalidFilters(t *testing.T) {
+	tests := []struct {
+		name  string
+		query string
+	}{
+		{name: "invalid app_id", query: "&app_id=not-a-uuid"},
+		{name: "invalid category_id", query: "&category_id=not-a-uuid"},
+		{name: "invalid project_id", query: "&project_id=not-a-uuid"},
+		{name: "invalid device_id", query: "&device_id=not-a-uuid"},
+		{name: "invalid precision", query: "&precision=bogus"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, token := newReportsTestRouter(t)
+
+			rec := doReportsReq(t, r, "/v1/reports/timeline?from=2024-01-01T00:00:00Z&to=2024-01-02T00:00:00Z"+tt.query, token)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
 // TestHTTP_ReportsCategories seeds a categorized event over the open
 // period so the response's "categories" breakdown is non-empty.
 func TestHTTP_ReportsCategories(t *testing.T) {

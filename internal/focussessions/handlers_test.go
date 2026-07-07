@@ -320,6 +320,23 @@ func TestHTTP_FocusSessionsMalformedIDNotFound(t *testing.T) {
 	}
 }
 
+// TestHTTP_FocusSessionsMalformedIDOnPatchAndDelete exercises Update's
+// and Delete's parseUUID error branch (ErrNotFound for a malformed id).
+func TestHTTP_FocusSessionsMalformedIDOnPatchAndDelete(t *testing.T) {
+	q := testQueries(t)
+	r, _, token, _ := newTestRouter(t, q)
+
+	patchRec := doJSON(t, r, http.MethodPatch, "/v1/focus-sessions/not-a-uuid", map[string]any{"status": "completed"}, token)
+	if patchRec.Code != http.StatusNotFound {
+		t.Fatalf("patch status = %d, want 404, body = %s", patchRec.Code, patchRec.Body.String())
+	}
+
+	deleteRec := doJSON(t, r, http.MethodDelete, "/v1/focus-sessions/not-a-uuid", nil, token)
+	if deleteRec.Code != http.StatusNotFound {
+		t.Fatalf("delete status = %d, want 404, body = %s", deleteRec.Code, deleteRec.Body.String())
+	}
+}
+
 // TestHTTP_FocusSessionsListInternalError exercises writeServiceError's
 // default (500) branch via an already-canceled request context.
 func TestHTTP_FocusSessionsListInternalError(t *testing.T) {
