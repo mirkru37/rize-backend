@@ -117,6 +117,59 @@ func TestDecodePullCursorRejectsInvalidInput(t *testing.T) {
 	}
 }
 
+// TestPullCursorIsZero covers store.PullCursor.IsZero, which RIZ-72's pull
+// cursor-reset check (internal/sync/pull.go) uses to exempt a first-ever
+// pull (empty/zero cursor) from ever being compared against the retained
+// prune horizon.
+func TestPullCursorIsZero(t *testing.T) {
+	tests := []struct {
+		name string
+		c    store.PullCursor
+		want bool
+	}{
+		{name: "zero value", c: store.PullCursor{}, want: true},
+		{name: "zero xid8, nonzero seq", c: store.PullCursor{Xid8: 0, ServerSeq: 1}, want: false},
+		{name: "nonzero xid8, zero seq", c: store.PullCursor{Xid8: 1, ServerSeq: 0}, want: false},
+		{name: "both nonzero", c: store.PullCursor{Xid8: 5, ServerSeq: 5}, want: false},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.c.IsZero(); got != tt.want {
+				t.Errorf("PullCursor(%+v).IsZero() = %v, want %v", tt.c, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestPullCursorLess covers store.PullCursor.Less, the (xid8, server_seq)
+// keyset ordering RIZ-72's cursor-reset check compares a caller's cursor
+// against the persisted horizon with.
+func TestPullCursorLess(t *testing.T) {
+	tests := []struct {
+		name string
+		a, b store.PullCursor
+		want bool
+	}{
+		{name: "equal tuples", a: store.PullCursor{Xid8: 10, ServerSeq: 20}, b: store.PullCursor{Xid8: 10, ServerSeq: 20}, want: false},
+		{name: "lower xid8 wins regardless of server_seq", a: store.PullCursor{Xid8: 1, ServerSeq: 999}, b: store.PullCursor{Xid8: 2, ServerSeq: 0}, want: true},
+		{name: "higher xid8 loses regardless of server_seq", a: store.PullCursor{Xid8: 2, ServerSeq: 0}, b: store.PullCursor{Xid8: 1, ServerSeq: 999}, want: false},
+		{name: "same xid8, lower server_seq wins", a: store.PullCursor{Xid8: 5, ServerSeq: 1}, b: store.PullCursor{Xid8: 5, ServerSeq: 2}, want: true},
+		{name: "same xid8, higher server_seq loses", a: store.PullCursor{Xid8: 5, ServerSeq: 2}, b: store.PullCursor{Xid8: 5, ServerSeq: 1}, want: false},
+		{name: "zero cursor is less than any real cursor", a: store.PullCursor{}, b: store.PullCursor{Xid8: 1, ServerSeq: 0}, want: true},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.a.Less(tt.b); got != tt.want {
+				t.Errorf("PullCursor(%+v).Less(%+v) = %v, want %v", tt.a, tt.b, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestLimitParam(t *testing.T) {
 	tests := []struct {
 		name string
