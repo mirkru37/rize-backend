@@ -26,9 +26,24 @@ SELECT remove_continuous_aggregate_policy('daily_app_totals', if_exists => true)
 
 -- Defensive: on a brand-new database, migrations 000016-000019 created
 -- these policies mere milliseconds before this migration removes them
--- again, which was observed (rarely) to race TimescaleDB's background job
--- scheduler catalog cleanup ("tuple concurrently deleted") when migration
--- 000031 immediately drops the underlying view. A short pause here gives
--- that catalog cleanup time to settle before the drop; it costs nothing on
--- an already-established database where the policies are not brand new.
-SELECT pg_sleep(0.5);
+-- again, which was observed (rarely) to race a "TimescaleDB Background
+-- Worker" backend still executing a scheduled job against these caggs
+-- ("tuple concurrently deleted") when migration 000031 immediately drops
+-- the underlying view. remove_continuous_aggregate_policy above removes
+-- the job's catalog row synchronously, but does not wait for an
+-- already-launched worker PROCESS to exit, so this polls
+-- pg_stat_activity (bounded: up to 20 * 50ms = 1s) for that backend_type
+-- to disappear before proceeding, rather than blindly sleeping a fixed
+-- duration on every run — the common case (no worker was ever launched
+-- yet) exits the loop immediately.
+DO $$
+DECLARE
+    remaining int := 20;
+BEGIN
+    WHILE remaining > 0 AND EXISTS (
+        SELECT 1 FROM pg_stat_activity WHERE backend_type = 'TimescaleDB Background Worker'
+    ) LOOP
+        PERFORM pg_sleep(0.05);
+        remaining := remaining - 1;
+    END LOOP;
+END $$;

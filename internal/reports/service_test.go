@@ -53,7 +53,7 @@ func testDBPool(t *testing.T) *pgxpool.Pool {
 // refreshCaggs forces an immediate materialization of the three
 // continuous aggregates this package reads from, per
 // documentation/database-schema.md's Continuous Aggregates section.
-// Migration 000029 recreated these caggs with
+// Migrations 000034-000036 recreated these caggs with
 // timescaledb.materialized_only = false (RIZ-74), so a query against them
 // already unions materialized data with a real-time read over the
 // not-yet-materialized tail of activity_events — a manual refresh is no
@@ -535,22 +535,28 @@ func TestCategoriesInvalidPrecisionRejected(t *testing.T) {
 	}
 }
 
-// TestCategoriesClosedDaySameDeviceOverlapCappedMatchesRaw is a regression
-// test (RIZ-74, PR #9 review follow-up): before migration 000029 added a
-// device_id dimension to daily_category_totals, the closed-period cagg
-// path summed duration_s with no way to cap same-device overlap, so it
-// could double-count overlapping same-device activity_events rows that the
-// raw/open-period path already caps (documentation/sync-protocol.md
-// §Overlap Rules; internal/reports/trim.go). Two identical full-day
-// events on the same device push the naive sum to double the day's
-// length, entirely inside one closed day, which both exercises the cagg
-// path's per-device window cap (internal/store/queries/activities.sql's
-// CategoryTotalsForRange) and lands on the exact value the raw path's
-// interval merge also produces for two fully-overlapping intervals — the
-// window cap and the raw merge necessarily agree whenever the merged
-// union spans the whole window, letting this assert the two paths give
-// the identical, non-double-counted total.
-func TestCategoriesClosedDaySameDeviceOverlapCappedMatchesRaw(t *testing.T) {
+// TestCategoriesClosedDaySameDeviceFullyOverlappingCapMatchesRawMerge is a
+// regression test (RIZ-74, PR #9 review follow-up): before migration
+// 000035 added a device_id dimension to daily_category_totals, the
+// closed-period cagg path summed duration_s with no bound on same-device
+// overlap at all, so it could inflate a total by an unbounded amount
+// relative to the raw/open-period path's interval merge
+// (documentation/sync-protocol.md §Overlap Rules; internal/reports/trim.go).
+// Two identical full-day events on the same device push the naive sum to
+// double the day's length, entirely inside one closed day.
+//
+// This specific input — full-day-spanning, fully-overlapping intervals —
+// is the one case where the cagg path's per-device window cap
+// (internal/store/queries/activities.sql's CategoryTotalsForRange:
+// LEAST(device_total_s, window_seconds)) and the raw path's exact interval
+// merge (internal/reports/trim.go) necessarily agree: the merged coverage
+// spans the whole window, so both the cap and the merge land on exactly
+// the window's length. This is NOT a general equivalence claim — see
+// TestCategoriesClosedDayPartialOverlapCagCapDivergesFromRawMerge below
+// for an input where the two paths disagree — only that this cap removes
+// the previously-unbounded inflation for the case where it happens to be
+// exact.
+func TestCategoriesClosedDaySameDeviceFullyOverlappingCapMatchesRawMerge(t *testing.T) {
 	pool := testDBPool(t)
 	q := storedb.New(pool)
 	user, deviceA, _ := newUserAndDevices(t, q)
@@ -594,12 +600,78 @@ func TestCategoriesClosedDaySameDeviceOverlapCappedMatchesRaw(t *testing.T) {
 		t.Errorf("raw-path total seconds = %d, want %d (same-device overlap must be merged, not summed)", rawTotal, wantMerged)
 	}
 	if caggTotal != rawTotal {
-		t.Errorf("cagg-path total (%d) and raw-path total (%d) disagree; closed-period trim must match the raw path", caggTotal, rawTotal)
+		t.Errorf("cagg-path total (%d) and raw-path total (%d) disagree; expected them to agree for this fully-overlapping-full-window input", caggTotal, rawTotal)
+	}
+}
+
+// TestCategoriesClosedDayPartialOverlapCagCapDivergesFromRawMerge documents
+// (RIZ-74, PR #9 review follow-up) the known, deliberate divergence between
+// the closed-period cagg path's per-device window cap and the raw path's
+// exact interval merge: the cap
+// (internal/store/queries/activities.sql's CategoryTotalsForRange:
+// LEAST(device_total_s, window_seconds)) only removes overlap severe
+// enough to push a device's naive summed total_s above the window's own
+// length. A same-device overlap that doesn't reach that threshold still
+// passes through uncapped, so the cagg path can overstate a total
+// relative to the raw path's true merged duration.
+//
+// Two same-device events over a 24h closed day, 00:00-06:00 and
+// 03:00-09:00 (naive sum 12h, merged/raw coverage 9h): the raw path
+// returns 9h; the cagg path returns min(12h, 24h) = 12h, since 12h never
+// exceeds the 24h window. This is the exact counterexample from
+// CategoryTotalsForRange's doc comment, asserted here as a regression
+// test so a future change can't silently start claiming (or requiring)
+// exact equivalence between the two paths.
+func TestCategoriesClosedDayPartialOverlapCagCapDivergesFromRawMerge(t *testing.T) {
+	pool := testDBPool(t)
+	q := storedb.New(pool)
+	user, deviceA, _ := newUserAndDevices(t, q)
+	cat := newCategory(t, q, user.ID, "Development")
+
+	day := pastDay(13)
+	// Same-device, partially-overlapping events: naive sum 12h, merged
+	// (raw) coverage 9h (00:00-09:00).
+	insertEvent(t, q, user.ID, deviceA.ID, day, day.Add(6*time.Hour), eventOpts{CategoryID: cat.ID})
+	insertEvent(t, q, user.ID, deviceA.ID, day.Add(3*time.Hour), day.Add(9*time.Hour), eventOpts{CategoryID: cat.ID})
+	refreshCaggs(t, pool)
+
+	svc := &Service{Queries: q}
+
+	caggResult, err := svc.Categories(context.Background(), user.ID.String(), day, day.AddDate(0, 0, 1), reportFilters{})
+	if err != nil {
+		t.Fatalf("Categories (cagg path): %v", err)
+	}
+	var caggTotal int64
+	for _, c := range caggResult.Categories {
+		caggTotal += c.Seconds
+	}
+
+	// A precision filter is incompatible with the cagg fast path, forcing
+	// categoryTotals to fall back to rawTotals for the whole range.
+	rawResult, err := svc.Categories(context.Background(), user.ID.String(), day, day.AddDate(0, 0, 1), reportFilters{Precision: "exact"})
+	if err != nil {
+		t.Fatalf("Categories (raw path): %v", err)
+	}
+	var rawTotal int64
+	for _, c := range rawResult.Categories {
+		rawTotal += c.Seconds
+	}
+
+	const wantRaw = 9 * 60 * 60
+	const wantCagg = 12 * 60 * 60
+	if rawTotal != wantRaw {
+		t.Errorf("raw-path total seconds = %d, want %d (exact merged coverage)", rawTotal, wantRaw)
+	}
+	if caggTotal != wantCagg {
+		t.Errorf("cagg-path total seconds = %d, want %d (window cap does not remove overlap below the window's own length)", caggTotal, wantCagg)
+	}
+	if caggTotal == rawTotal {
+		t.Errorf("cagg-path total (%d) unexpectedly matches raw-path total (%d); this input is meant to demonstrate the two paths diverge", caggTotal, rawTotal)
 	}
 }
 
 // TestReportCaggsAreConfiguredMaterializedOnlyFalse is a schema-level check
-// (RIZ-74, PR #9 review follow-up) that migrations 000033-000035 actually
+// (RIZ-74, PR #9 review follow-up) that migrations 000034-000036 actually
 // left daily_app_totals, daily_category_totals, and hourly_category_totals
 // configured as real-time (materialized_only = false) continuous
 // aggregates, per documentation/architecture-backend.md §Aggregation
@@ -617,14 +689,14 @@ func TestReportCaggsAreConfiguredMaterializedOnlyFalse(t *testing.T) {
 			t.Fatalf("querying materialized_only for %s: %v", view, err)
 		}
 		if materializedOnly {
-			t.Errorf("%s: materialized_only = true, want false (migrations 000033-000035)", view)
+			t.Errorf("%s: materialized_only = true, want false (migrations 000034-000036)", view)
 		}
 	}
 }
 
 // TestCategoryTotalsForRangeReflectsRealTimeDataWithNoRefresh is a
 // real-time-aggregation proof (RIZ-74, PR #9 review follow-up): migration
-// 000034 recreated daily_category_totals with timescaledb.materialized_only
+// 000035 recreated daily_category_totals with timescaledb.materialized_only
 // = false, so a query against it unions materialized data with a live read
 // over not-yet-materialized activity_events rows, rather than a plain
 // materialized_only = true view (the pre-RIZ-74 shape), which would return

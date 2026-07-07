@@ -30,8 +30,12 @@ type Querier interface {
 	// internal/reports/service.go.
 	//
 	// Same per-device window-capping as CategoryTotalsForRange above, using
-	// daily_app_totals' device_id column (migration 000029) to reproduce the
-	// raw path's same-device overlap cap for closed periods.
+	// daily_app_totals' device_id column (migration 000034) — an upper bound
+	// on same-device overlap inflation for closed periods, not a
+	// reproduction of the raw path's exact interval merge. See
+	// CategoryTotalsForRange's comment for the worked counterexample where
+	// the two paths diverge. window_seconds must be > 0 for the same reason
+	// noted there.
 	AppTotalsForRange(ctx context.Context, arg AppTotalsForRangeParams) ([]AppTotalsForRangeRow, error)
 	// Closed-period fast path for reports/daily, reports/categories, and
 	// reports/summary's category breakdown: sums the daily_category_totals
@@ -40,17 +44,26 @@ type Querier interface {
 	// when the request has no device_id/precision filter — see
 	// internal/reports/service.go.
 	//
-	// Reproduces the raw-event path's same-device overlap cap
-	// (documentation/sync-protocol.md §Overlap Rules; internal/reports/trim.go
-	// implements it for raw events): daily_category_totals is grouped by
-	// device_id (migration 000029), so each device's total_s is first summed
-	// across the requested days, then capped at window_seconds — the length of
-	// [from_day, to_day) in seconds — before being added into the category
-	// total. This mirrors the raw path's "a single device never contributes
-	// more active time to a window than the window itself contains" invariant
-	// without needing per-event intervals. Cross-device overlap is still not
-	// trimmed: each device's capped total is summed into the category total
-	// independently, same as the raw path.
+	// Bounds (does NOT reproduce) the raw-event path's same-device overlap
+	// handling (documentation/sync-protocol.md §Overlap Rules;
+	// internal/reports/trim.go implements the actual interval merge for raw
+	// events): daily_category_totals is grouped by device_id (migration
+	// 000035), so each device's total_s is first summed across the requested
+	// days, then capped at window_seconds — the length of [from_day, to_day)
+	// in seconds — before being added into the category total. This is an
+	// UPPER BOUND on same-device overlap inflation, not the raw path's exact
+	// merged duration: the cap only removes overlap that pushes a device's
+	// naive summed total_s above the window's own length, so it agrees with
+	// the raw path exactly when a device's merged coverage spans the whole
+	// window, but can still overstate the total otherwise. For example, over
+	// a 24h window with same-device events covering 00:00-06:00 and
+	// 03:00-09:00 (merged coverage 9h, naive sum 12h), the raw path returns
+	// 9h while this query returns min(12h, 24h) = 12h. Cross-device overlap
+	// is still not trimmed either way: each device's capped total is summed
+	// into the category total independently, same as the raw path.
+	// window_seconds must be > 0 (validated by the caller — see
+	// internal/reports/dimension.go's windowSeconds) so LEAST(x, 0) can't
+	// silently zero every total.
 	CategoryTotalsForRange(ctx context.Context, arg CategoryTotalsForRangeParams) ([]CategoryTotalsForRangeRow, error)
 	// Auto-creates an apps row the first time a bundle_id/platform pair is
 	// observed during ingestion, per documentation/architecture-backend.md
@@ -324,9 +337,15 @@ type Querier interface {
 	// The report layer's raw-event pass, per documentation/architecture-backend.md
 	// §Aggregation Strategy: used (a) always for the current/partial period,
 	// and (b) as the only path for filters (device_id, precision) or
-	// dimensions (project) the continuous aggregates cannot serve, since
-	// daily_app_totals/daily_category_totals carry no device_id or precision
-	// column and no project-dimensioned aggregate exists at all — see
+	// dimensions (project) the continuous aggregates cannot serve. As of
+	// migrations 000034-000036, daily_app_totals/daily_category_totals do
+	// carry a device_id column, but CategoryTotalsForRange/AppTotalsForRange
+	// below only use it for a same-device overlap *cap* (a window-length
+	// upper bound, not an exact merge — see those queries' comments); neither
+	// query can honor an explicit device_id filter or a precision filter (no
+	// precision column exists on any cagg), and no project-dimensioned
+	// aggregate exists at all, so a device_id/precision-filtered or
+	// project-dimensioned request still falls back to this raw pass — see
 	// internal/reports' service.go doc comment for the full resolution.
 	//
 	// Selects events overlapping [from_ts, to_ts) — not merely started within

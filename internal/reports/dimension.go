@@ -62,14 +62,28 @@ func pgTimestamptz(t time.Time) pgtype.Timestamptz {
 }
 
 // windowSeconds is the closed-period cagg queries' device-overlap cap
-// bound: the length, in seconds, of a closed window. It mirrors
-// perDeviceSeconds' windowEnd-windowStart clip for the raw path, but
-// applied to a device's already-summed total_s (see
+// bound: the length, in seconds, of a closed window, used by
 // internal/store/queries/activities.sql's CategoryTotalsForRange and
-// AppTotalsForRange) rather than to individual intervals, since the
-// continuous aggregates only retain per-day sums, not raw intervals.
+// AppTotalsForRange as an UPPER BOUND on how much same-device overlap a
+// device's total_s can be inflated by. It is not the same computation as
+// perDeviceSeconds' interval merge for the raw path: that clips and
+// merges individual event intervals, so it always returns each device's
+// exact non-overlapping covered duration; this instead caps an
+// already-summed total_s at the window's length, which only catches
+// overlap severe enough to push the naive sum above the window itself —
+// see CategoryTotalsForRange's doc comment for a worked example where the
+// two disagree. The two callers only ever invoke this with a genuinely
+// closed (non-empty, from-before-to) window per splitClosedOpen, but the
+// callers pass the result straight into LEAST(device_total_s,
+// window_seconds) in SQL, where a zero or negative value would silently
+// zero out every total — so this defends that invariant explicitly rather
+// than relying on the caller never regressing it.
 func windowSeconds(w window) int64 {
-	return int64(w.To.Sub(w.From).Seconds())
+	seconds := int64(w.To.Sub(w.From).Seconds())
+	if seconds < 1 {
+		seconds = 1
+	}
+	return seconds
 }
 
 func derefStr(p *string) string {
