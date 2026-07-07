@@ -339,6 +339,26 @@ func (s *Service) pull(ctx context.Context, userID, rawCursor string, rawLimit i
 	)
 
 	err = s.runInPullSnapshot(ctx, func(q storedb.Querier) error {
+		// RIZ-72: reject a cursor that's strictly below the retained
+		// prune horizon BEFORE running ListChangelogPage, in the same
+		// REPEATABLE READ snapshot as that query, so the check and the
+		// page it would otherwise gate are always consistent with each
+		// other. A first-ever pull (empty/zero cursor) is exempt: "from
+		// the beginning" is always servable — a prune only ever deletes
+		// rows, it never rewrites what "the beginning" of the surviving
+		// stream is, so there is nothing to reset for that case (see
+		// store.PullCursor.IsZero's doc comment).
+		if !cursor.IsZero() {
+			horizonRow, err := q.GetChangelogHorizon(ctx)
+			if err != nil {
+				return fmt.Errorf("sync: get changelog horizon: %w", err)
+			}
+			horizon := store.PullCursor{Xid8: horizonRow.HorizonXid8.Uint64, ServerSeq: horizonRow.HorizonServerSeq}
+			if cursor.Less(horizon) {
+				return ErrCursorExpired
+			}
+		}
+
 		rows, err := q.ListChangelogPage(ctx, storedb.ListChangelogPageParams{
 			UserID:     uid,
 			CursorXid8: pgtype.Uint64{Uint64: cursor.Xid8, Valid: true},
