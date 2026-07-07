@@ -50,16 +50,18 @@ type Category struct {
 }
 
 type DailyAppTotal struct {
-	UserID pgtype.UUID `json:"user_id"`
-	Day    interface{} `json:"day"`
-	AppID  pgtype.UUID `json:"app_id"`
-	TotalS int64       `json:"total_s"`
+	UserID   pgtype.UUID `json:"user_id"`
+	Day      interface{} `json:"day"`
+	AppID    pgtype.UUID `json:"app_id"`
+	DeviceID pgtype.UUID `json:"device_id"`
+	TotalS   int64       `json:"total_s"`
 }
 
 type DailyCategoryTotal struct {
 	UserID     pgtype.UUID `json:"user_id"`
 	Day        interface{} `json:"day"`
 	CategoryID pgtype.UUID `json:"category_id"`
+	DeviceID   pgtype.UUID `json:"device_id"`
 	TotalS     int64       `json:"total_s"`
 }
 
@@ -112,6 +114,7 @@ type HourlyCategoryTotal struct {
 	UserID     pgtype.UUID `json:"user_id"`
 	Hour       interface{} `json:"hour"`
 	CategoryID pgtype.UUID `json:"category_id"`
+	DeviceID   pgtype.UUID `json:"device_id"`
 	TotalS     int64       `json:"total_s"`
 }
 

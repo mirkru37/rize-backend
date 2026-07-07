@@ -13,20 +13,28 @@ import (
 
 const appTotalsForRange = `-- name: AppTotalsForRange :many
 SELECT
-    d.app_id,
+    pd.app_id,
     a.name AS app_name,
     a.bundle_id AS app_bundle_id,
-    sum(d.total_s)::bigint AS total_s
-FROM daily_app_totals d
-LEFT JOIN apps a ON a.id = d.app_id
-WHERE d.user_id = $1 AND d.day >= $2::timestamptz AND d.day < $3::timestamptz
-GROUP BY d.app_id, a.name, a.bundle_id
+    sum(LEAST(pd.device_total_s, $2::bigint))::bigint AS total_s
+FROM (
+    SELECT
+        d.app_id,
+        d.device_id,
+        sum(d.total_s) AS device_total_s
+    FROM daily_app_totals d
+    WHERE d.user_id = $1 AND d.day >= $3::timestamptz AND d.day < $4::timestamptz
+    GROUP BY d.app_id, d.device_id
+) pd
+LEFT JOIN apps a ON a.id = pd.app_id
+GROUP BY pd.app_id, a.name, a.bundle_id
 `
 
 type AppTotalsForRangeParams struct {
-	UserID  pgtype.UUID        `json:"user_id"`
-	FromDay pgtype.Timestamptz `json:"from_day"`
-	ToDay   pgtype.Timestamptz `json:"to_day"`
+	UserID        pgtype.UUID        `json:"user_id"`
+	WindowSeconds int64              `json:"window_seconds"`
+	FromDay       pgtype.Timestamptz `json:"from_day"`
+	ToDay         pgtype.Timestamptz `json:"to_day"`
 }
 
 type AppTotalsForRangeRow struct {
@@ -41,8 +49,17 @@ type AppTotalsForRangeRow struct {
 // documentation/architecture-backend.md §Aggregation Strategy. Only used
 // when the request has no device_id/precision filter — see
 // internal/reports/service.go.
+//
+// Same per-device window-capping as CategoryTotalsForRange above, using
+// daily_app_totals' device_id column (migration 000029) to reproduce the
+// raw path's same-device overlap cap for closed periods.
 func (q *Queries) AppTotalsForRange(ctx context.Context, arg AppTotalsForRangeParams) ([]AppTotalsForRangeRow, error) {
-	rows, err := q.db.Query(ctx, appTotalsForRange, arg.UserID, arg.FromDay, arg.ToDay)
+	rows, err := q.db.Query(ctx, appTotalsForRange,
+		arg.UserID,
+		arg.WindowSeconds,
+		arg.FromDay,
+		arg.ToDay,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -68,19 +85,27 @@ func (q *Queries) AppTotalsForRange(ctx context.Context, arg AppTotalsForRangePa
 
 const categoryTotalsForRange = `-- name: CategoryTotalsForRange :many
 SELECT
-    d.category_id,
+    pd.category_id,
     c.name AS category_name,
-    sum(d.total_s)::bigint AS total_s
-FROM daily_category_totals d
-LEFT JOIN categories c ON c.id = d.category_id
-WHERE d.user_id = $1 AND d.day >= $2::timestamptz AND d.day < $3::timestamptz
-GROUP BY d.category_id, c.name
+    sum(LEAST(pd.device_total_s, $2::bigint))::bigint AS total_s
+FROM (
+    SELECT
+        d.category_id,
+        d.device_id,
+        sum(d.total_s) AS device_total_s
+    FROM daily_category_totals d
+    WHERE d.user_id = $1 AND d.day >= $3::timestamptz AND d.day < $4::timestamptz
+    GROUP BY d.category_id, d.device_id
+) pd
+LEFT JOIN categories c ON c.id = pd.category_id
+GROUP BY pd.category_id, c.name
 `
 
 type CategoryTotalsForRangeParams struct {
-	UserID  pgtype.UUID        `json:"user_id"`
-	FromDay pgtype.Timestamptz `json:"from_day"`
-	ToDay   pgtype.Timestamptz `json:"to_day"`
+	UserID        pgtype.UUID        `json:"user_id"`
+	WindowSeconds int64              `json:"window_seconds"`
+	FromDay       pgtype.Timestamptz `json:"from_day"`
+	ToDay         pgtype.Timestamptz `json:"to_day"`
 }
 
 type CategoryTotalsForRangeRow struct {
@@ -93,10 +118,27 @@ type CategoryTotalsForRangeRow struct {
 // reports/summary's category breakdown: sums the daily_category_totals
 // continuous aggregate over [from_day, to_day) per
 // documentation/architecture-backend.md §Aggregation Strategy. Only used
-// when the request has no device_id/precision filter (the aggregate has
-// neither dimension) — see internal/reports/service.go.
+// when the request has no device_id/precision filter — see
+// internal/reports/service.go.
+//
+// Reproduces the raw-event path's same-device overlap cap
+// (documentation/sync-protocol.md §Overlap Rules; internal/reports/trim.go
+// implements it for raw events): daily_category_totals is grouped by
+// device_id (migration 000029), so each device's total_s is first summed
+// across the requested days, then capped at window_seconds — the length of
+// [from_day, to_day) in seconds — before being added into the category
+// total. This mirrors the raw path's "a single device never contributes
+// more active time to a window than the window itself contains" invariant
+// without needing per-event intervals. Cross-device overlap is still not
+// trimmed: each device's capped total is summed into the category total
+// independently, same as the raw path.
 func (q *Queries) CategoryTotalsForRange(ctx context.Context, arg CategoryTotalsForRangeParams) ([]CategoryTotalsForRangeRow, error) {
-	rows, err := q.db.Query(ctx, categoryTotalsForRange, arg.UserID, arg.FromDay, arg.ToDay)
+	rows, err := q.db.Query(ctx, categoryTotalsForRange,
+		arg.UserID,
+		arg.WindowSeconds,
+		arg.FromDay,
+		arg.ToDay,
+	)
 	if err != nil {
 		return nil, err
 	}

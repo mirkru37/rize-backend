@@ -28,13 +28,29 @@ type Querier interface {
 	// documentation/architecture-backend.md §Aggregation Strategy. Only used
 	// when the request has no device_id/precision filter — see
 	// internal/reports/service.go.
+	//
+	// Same per-device window-capping as CategoryTotalsForRange above, using
+	// daily_app_totals' device_id column (migration 000029) to reproduce the
+	// raw path's same-device overlap cap for closed periods.
 	AppTotalsForRange(ctx context.Context, arg AppTotalsForRangeParams) ([]AppTotalsForRangeRow, error)
 	// Closed-period fast path for reports/daily, reports/categories, and
 	// reports/summary's category breakdown: sums the daily_category_totals
 	// continuous aggregate over [from_day, to_day) per
 	// documentation/architecture-backend.md §Aggregation Strategy. Only used
-	// when the request has no device_id/precision filter (the aggregate has
-	// neither dimension) — see internal/reports/service.go.
+	// when the request has no device_id/precision filter — see
+	// internal/reports/service.go.
+	//
+	// Reproduces the raw-event path's same-device overlap cap
+	// (documentation/sync-protocol.md §Overlap Rules; internal/reports/trim.go
+	// implements it for raw events): daily_category_totals is grouped by
+	// device_id (migration 000029), so each device's total_s is first summed
+	// across the requested days, then capped at window_seconds — the length of
+	// [from_day, to_day) in seconds — before being added into the category
+	// total. This mirrors the raw path's "a single device never contributes
+	// more active time to a window than the window itself contains" invariant
+	// without needing per-event intervals. Cross-device overlap is still not
+	// trimmed: each device's capped total is summed into the category total
+	// independently, same as the raw path.
 	CategoryTotalsForRange(ctx context.Context, arg CategoryTotalsForRangeParams) ([]CategoryTotalsForRangeRow, error)
 	// Auto-creates an apps row the first time a bundle_id/platform pair is
 	// observed during ingestion, per documentation/architecture-backend.md
