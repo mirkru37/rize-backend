@@ -11,10 +11,13 @@ permissions:
 
 env:
   # RIZ-69: single knob for the total-statement coverage gate enforced by
-  # the Test job below. Raise this over time as coverage improves; never
-  # lower it (or widen the exclusion list below) just to make a red run
-  # pass — add tests instead.
-  COVERAGE_THRESHOLD: 90
+  # the Test job below. Set to 80 per explicit user decision (2026-07-07,
+  # relayed by the orchestrator; RIZ-69's Linear ticket was amended to
+  # match) after this ticket's test additions raised total first-party
+  # coverage from a ~50.5% baseline to ~87.7%. Raise this over time as
+  # coverage improves; never lower it (or widen the exclusion list below)
+  # just to make a red run pass — add tests instead.
+  COVERAGE_THRESHOLD: 80
 
 jobs:
   lint:
