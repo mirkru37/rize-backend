@@ -11,6 +11,18 @@ import (
 )
 
 type Querier interface {
+	// Advances the single sync_changelog_horizon row to the maximum of its
+	// current (horizon_xid8, horizon_server_seq) and the caller-supplied
+	// values (the max xid8/server_seq among the batch just deleted). GREATEST
+	// (rather than an unconditional SET) makes this safe to call with a batch
+	// whose max happens to be behind the already-recorded horizon — which
+	// cannot happen in the normal single-pruner-instance case (batches are
+	// processed in changelog_id order, which is also non-decreasing in
+	// (xid8, server_seq) per migration 000025's gap-free-by-construction
+	// invariant) but keeps this query correct/idempotent under retry or a
+	// hypothetical second pruner instance rather than relying on that
+	// invariant to hold at the call site too.
+	AdvanceChangelogHorizon(ctx context.Context, arg AdvanceChangelogHorizonParams) (AdvanceChangelogHorizonRow, error)
 	// Closed-period fast path for reports/apps: sums the daily_app_totals
 	// continuous aggregate over [from_day, to_day) per
 	// documentation/architecture-backend.md §Aggregation Strategy. Only used
@@ -76,6 +88,14 @@ type Querier interface {
 	// keeping every syncable table's server_seq drawn from the same global
 	// sequence space per documentation/sync-protocol.md.
 	CreateUser(ctx context.Context, arg CreateUserParams) (User, error)
+	// Deletes exactly the rows SelectChangelogPruneBatch identified, by their
+	// changelog_id primary keys, in the SAME transaction as that select. Using
+	// the exact id set (rather than re-evaluating the created_at < cutoff
+	// predicate a second time) means this DELETE can never race with a
+	// concurrent write that inserted a new, unrelated row after the select ran
+	// but before the delete executes — it only ever touches the exact rows
+	// already identified as prune candidates.
+	DeleteChangelogRows(ctx context.Context, changelogIds []int64) (int64, error)
 	// Resolves a sync_changelog 'activity_events' entry to the entity's current
 	// state, per internal/sync/pull.go's per-page dedupe-then-resolve step.
 	// Binds started_at (the hypertable's partitioning column, carried on the
@@ -104,6 +124,14 @@ type Querier interface {
 	// GET /v1/categories/{id}: readable if it's a system default or the
 	// caller's own, per database-schema.md's categories.user_id semantics.
 	GetCategoryForUser(ctx context.Context, arg GetCategoryForUserParams) (Category, error)
+	// Reads the current retained horizon, per internal/sync/pull.go's
+	// cursor-reset check: a pull whose caller-supplied cursor is strictly
+	// below this position cannot be served a gap-free page (rows between its
+	// cursor and here were deleted by age-based retention) and must be told to
+	// reset instead. Called inside the same REPEATABLE READ, READ ONLY
+	// transaction as the rest of a pull (runInPullSnapshot) so the horizon
+	// check and the changelog page read observe one consistent snapshot.
+	GetChangelogHorizon(ctx context.Context) (GetChangelogHorizonRow, error)
 	// Scoped by user_id per documentation/security.md §Tenant Isolation: every
 	// query is scoped by user_id from the access token, so a request
 	// authenticated as one user can never read another user's device row.
@@ -346,6 +374,22 @@ type Querier interface {
 	// documentation/security.md §Token model.
 	RevokeRefreshTokensByDevice(ctx context.Context, arg RevokeRefreshTokensByDeviceParams) error
 	RotateRefreshToken(ctx context.Context, arg RotateRefreshTokenParams) (RefreshToken, error)
+	// One bounded batch of sync_changelog rows eligible for age-based pruning
+	// (RIZ-72): every row whose created_at is strictly before cutoff (the
+	// caller-computed now() - SYNC_CHANGELOG_MAX_AGE boundary), oldest
+	// (changelog_id) first, capped at batch_limit so a single prune tick never
+	// holds a huge result set or a long-running transaction. The caller
+	// (internal/sync's retention Pruner) deletes exactly these rows and
+	// advances sync_changelog_horizon from their (xid8, server_seq) tuples in
+	// the SAME database transaction as this SELECT — see DeleteChangelogRows
+	// and AdvanceChangelogHorizon below, and internal/sync/retention.go's
+	// PruneOnce for the transactional pairing.
+	//
+	// xmin_xid8(xmin) (migration 000025) is selected here, before the rows are
+	// deleted, because it cannot be recovered afterward — once a row is gone
+	// its xmin is gone with it. Capturing it here is what lets the horizon
+	// advance to the exact commit-ordered position these rows occupied.
+	SelectChangelogPruneBatch(ctx context.Context, arg SelectChangelogPruneBatchParams) ([]SelectChangelogPruneBatchRow, error)
 	// DELETE /v1/focus-sessions/{id}. Soft delete via deleted_at so the
 	// deletion propagates as a tombstone through GET /v1/sync/changes.
 	SoftDeleteFocusSessionForUser(ctx context.Context, arg SoftDeleteFocusSessionForUserParams) (int64, error)
