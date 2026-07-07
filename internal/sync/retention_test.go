@@ -53,7 +53,7 @@ func newSyncTestRouterWithPool(t *testing.T) (*chi.Mux, *pgxpool.Pool, storedb.U
 
 // backdateChangelogRow rewrites the sync_changelog row for entityID's
 // created_at, simulating "this row was written age ago" for retention
-// tests (RIZ-72 added created_at in migration 000027; there is no write
+// tests (RIZ-72 added created_at in migration 000029; there is no write
 // path that lets a test control it directly, since it's always now() at
 // insert time via the entity table's AFTER trigger).
 func backdateChangelogRow(t *testing.T, pool *pgxpool.Pool, entityID pgtype.UUID, age time.Duration) {
